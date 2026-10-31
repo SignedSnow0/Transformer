@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run project",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/simple_transformer.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cargo build"
+    }
+  ]
+}
