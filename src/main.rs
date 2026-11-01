@@ -1,44 +1,58 @@
 mod autograd;
+mod transformer;
 
 use numr::runtime::cpu::CpuDevice;
 use numr::tensor::Tensor;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = CpuDevice::new();
+    let seq_len = 10;
+    let d_model = 16;
+    let d_ff = 64;
+
+    let input_embeddings = Tensor::from_slice(
+        &vec![0.5_f32; seq_len * d_model],
+        &[seq_len, d_model],
+        &device,
+    )?;
 
     let mut graph = autograd::Graph::new();
-    let var_1 = graph
-        .variable(
-            Tensor::from_slice(
-                &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
-                &[3, 3],
-                &device,
-            )
-            .unwrap(),
-        )
-        .expect("Failed to create variable");
-    let var_2 = graph
-        .variable(
-            Tensor::from_slice(
-                &[9.0_f32, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
-                &[3, 3],
-                &device,
-            )
-            .unwrap(),
-        )
-        .expect("Failed to create variable");
-    let node_3 = graph
-        .matmul(var_1, var_2)
-        .expect("Failed to perform matrix multiplication");
-    let _node_4 = graph
-        .causal_mask(node_3)
-        .expect("Failed to perform causal mask operation");
-    let _node_5 = graph
-        .softmax(var_1)
-        .expect("Failed to perform softmax operation");
+    let input_embeddings = graph.variable(input_embeddings)?;
+    let transformer_block = transformer::TransformerBlock::new(&mut graph, &device, d_model, d_ff)?;
+    let output =
+        transformer_block.apply_forward_block(&mut graph, &device, input_embeddings, d_model)?;
 
-    graph.backward(var_1).expect("Failed to compute gradients");
+    graph.backward(output)?;
 
-    println!("Values: {:#?}", graph.nodes[var_1].data);
-    println!("Gradients: {:#?}", graph.nodes[var_1].grad);
+    println!("Output: {:?}", graph.nodes[output].data.to_vec::<f32>());
+    println!(
+        "Gradient of input embeddings: {:?}",
+        graph.nodes[input_embeddings].grad.to_vec::<f32>()
+    );
+    println!(
+        "Gradient of w_q: {:?}",
+        graph.nodes[transformer_block.w_q].grad.to_vec::<f32>()
+    );
+    println!(
+        "Gradient of w_k: {:?}",
+        graph.nodes[transformer_block.w_k].grad.to_vec::<f32>()
+    );
+    println!(
+        "Gradient of w_v: {:?}",
+        graph.nodes[transformer_block.w_v].grad.to_vec::<f32>()
+    );
+
+    println!(
+        "Gradient of w_1: {:?}",
+        graph.nodes[transformer_block.w_1].grad.to_vec::<f32>()
+    );
+
+    println!(
+        "Gradient of w_2: {:?}",
+        graph.nodes[transformer_block.w_2].grad.to_vec::<f32>()
+    );
+
+    println!("All gradients computed successfully.");
+
+    Ok(())
 }
