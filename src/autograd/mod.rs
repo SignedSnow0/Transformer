@@ -31,6 +31,8 @@ pub enum Operation {
     Relu(NodeId),
     /// Two-dimensional transpose: `x_ij = a_ji`.
     Transpose(NodeId),
+    /// Layer normalization: `x_i = gamma * (a_i - mean(a)) / sqrt(var(a) + eps) + beta`.
+    LayerNorm(NodeId, NodeId, NodeId, f32),
 }
 
 /// A single computational step in a graph.
@@ -237,6 +239,53 @@ impl Graph {
         Ok(self.nodes.len() - 1)
     }
 
+    /// Applies layer normalization to a node.
+    ///     
+    /// # Arguments
+    ///
+    /// * `a` - The node to normalize.
+    /// * `gamma` - The scale parameter.
+    /// * `beta` - The shift parameter.
+    /// * `eps` - A small value added to the variance for numerical stability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the layer normalization operation fails.
+    pub fn layer_norm(
+        &mut self,
+        a: NodeId,
+        gamma: NodeId,
+        beta: NodeId,
+        eps: f32,
+    ) -> Result<NodeId> {
+        let x_data = &self.nodes[a].data;
+        let g_data = &self.nodes[gamma].data;
+        let b_data = &self.nodes[beta].data;
+
+        let last_dim = x_data.shape().len() - 1;
+
+        let mean = x_data.mean(&[last_dim], true)?;
+
+        let x_centered = x_data.sub(&mean)?;
+        let x_sq = x_centered.mul(&x_centered)?;
+        let var = x_sq.mean(&[last_dim], true)?;
+
+        let std_inv = var.add_scalar(eps as f64)?.sqrt()?.recip()?;
+        let x_hat = x_centered.mul(&std_inv)?;
+
+        let data = x_hat.mul(g_data)?.add(b_data)?;
+        let grad = Tensor::zeros(data.shape(), data.dtype(), data.device())?;
+
+        let node = Node {
+            data,
+            grad,
+            op: Some(Operation::LayerNorm(a, gamma, beta, eps)),
+        };
+
+        self.nodes.push(node);
+        Ok(self.nodes.len() - 1)
+    }
+
     /// Computes gradients from an output node back through the graph.
     ///
     /// The output gradient is initialized to ones, and each node's gradient is
@@ -322,6 +371,37 @@ impl Graph {
                         let grad_a = node_grad.transpose(0, 1)?.contiguous()?;
 
                         self.nodes[a].grad = self.nodes[a].grad.add(&grad_a)?;
+                    }
+                    Operation::LayerNorm(x, gamma, beta, eps) => {
+                        let x_data = &self.nodes[x].data;
+                        let g_data = &self.nodes[gamma].data;
+                        let last_dim = x_data.shape().len() - 1;
+                        let d = x_data.shape()[last_dim] as f32;
+
+                        let mean = x_data.mean(&[last_dim], true)?;
+                        let x_centered = x_data.sub(&mean)?;
+                        let var = x_centered.mul(&x_centered)?.mean(&[last_dim], true)?;
+                        let std_inv = var.add_scalar(eps as f64)?.sqrt()?.recip()?;
+                        let x_hat = x_centered.mul(&std_inv)?;
+
+                        let d_gamma = node_grad.mul(&x_hat)?.sum(&[0], true)?;
+                        let d_beta = node_grad.sum(&[0], true)?;
+
+                        let d_xhat = node_grad.mul(g_data)?;
+
+                        let sum_d_xhat = d_xhat.sum(&[last_dim], true)?;
+                        let sum_d_xhat_xhat = d_xhat.mul(&x_hat)?.sum(&[last_dim], true)?;
+
+                        let term1 = d_xhat.mul_scalar(d as f64)?;
+                        let term2 = term1.sub(&sum_d_xhat)?;
+                        let term3 = x_hat.mul(&sum_d_xhat_xhat)?;
+                        let d_x = term2
+                            .sub(&term3)?
+                            .mul(&std_inv.mul_scalar(1.0 / d as f64)?)?;
+
+                        self.nodes[x].grad = self.nodes[x].grad.add(&d_x)?;
+                        self.nodes[gamma].grad = self.nodes[gamma].grad.add(&d_gamma)?;
+                        self.nodes[beta].grad = self.nodes[beta].grad.add(&d_beta)?;
                     }
                 }
             }
