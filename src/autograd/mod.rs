@@ -33,6 +33,8 @@ pub enum Operation {
     Transpose(NodeId),
     /// Layer normalization: `x_i = gamma * (a_i - mean(a)) / sqrt(var(a) + eps) + beta`.
     LayerNorm(NodeId, NodeId, NodeId, f32),
+    /// Concatenation of multiple inputs along a dimension.
+    Concat(Vec<NodeId>, usize),
 }
 
 /// A single computational step in a graph.
@@ -286,6 +288,41 @@ impl Graph {
         Ok(self.nodes.len() - 1)
     }
 
+    /// Concatenates nodes along a dimension.
+    ///
+    /// All inputs must have the same shape except along `dim`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `inputs` is empty or the tensors cannot be
+    /// concatenated.
+    pub fn concat(&mut self, inputs: &[NodeId], dim: usize) -> Result<NodeId> {
+        if inputs.is_empty() {
+            return Err(Error::InvalidArgument {
+                arg: "inputs",
+                reason: "concat requires at least one input".to_string(),
+            });
+        }
+
+        let data = {
+            let tensors: Vec<&Tensor<CpuRuntime>> = inputs
+                .iter()
+                .map(|&input| &self.nodes[input].data)
+                .collect();
+            Tensor::cat(&tensors, dim as isize)?
+        };
+        let grad = Tensor::zeros(data.shape(), data.dtype(), data.device())?;
+
+        let node = Node {
+            data,
+            grad,
+            op: Some(Operation::Concat(inputs.to_vec(), dim)),
+        };
+
+        self.nodes.push(node);
+        Ok(self.nodes.len() - 1)
+    }
+
     /// Computes gradients from an output node back through the graph.
     ///
     /// The output gradient is initialized to ones, and each node's gradient is
@@ -311,15 +348,20 @@ impl Graph {
             if let Some(op) = self.nodes[i].op.clone() {
                 match op {
                     Operation::Sum(a, b) => {
-                        self.nodes[a].grad = self.nodes[a].grad.add(&node_grad)?;
-                        self.nodes[b].grad = self.nodes[b].grad.add(&node_grad)?;
+                        let grad_a = reduce_broadcast(&node_grad, self.nodes[a].data.shape())?;
+                        let grad_b = reduce_broadcast(&node_grad, self.nodes[b].data.shape())?;
+
+                        self.nodes[a].grad = self.nodes[a].grad.add(&grad_a)?;
+                        self.nodes[b].grad = self.nodes[b].grad.add(&grad_b)?;
                     }
                     Operation::Mul(a, b) => {
-                        let node_a = &self.nodes[a];
-                        let node_b = &self.nodes[b];
+                        let a_shape = self.nodes[a].data.shape().to_vec();
+                        let b_shape = self.nodes[b].data.shape().to_vec();
 
-                        let grad_a = node_grad.mul(&node_b.data)?;
-                        let grad_b = node_a.data.mul(&node_grad)?;
+                        let grad_a =
+                            reduce_broadcast(&node_grad.mul(&self.nodes[b].data)?, &a_shape)?;
+                        let grad_b =
+                            reduce_broadcast(&self.nodes[a].data.mul(&node_grad)?, &b_shape)?;
 
                         self.nodes[a].grad = self.nodes[a].grad.add(&grad_a)?;
                         self.nodes[b].grad = self.nodes[b].grad.add(&grad_b)?;
@@ -384,8 +426,8 @@ impl Graph {
                         let std_inv = var.add_scalar(eps as f64)?.sqrt()?.recip()?;
                         let x_hat = x_centered.mul(&std_inv)?;
 
-                        let d_gamma = node_grad.mul(&x_hat)?.sum(&[0], true)?;
-                        let d_beta = node_grad.sum(&[0], true)?;
+                        let d_gamma = reduce_broadcast(&node_grad.mul(&x_hat)?, g_data.shape())?;
+                        let d_beta = reduce_broadcast(&node_grad, self.nodes[beta].data.shape())?;
 
                         let d_xhat = node_grad.mul(g_data)?;
 
@@ -402,6 +444,16 @@ impl Graph {
                         self.nodes[x].grad = self.nodes[x].grad.add(&d_x)?;
                         self.nodes[gamma].grad = self.nodes[gamma].grad.add(&d_gamma)?;
                         self.nodes[beta].grad = self.nodes[beta].grad.add(&d_beta)?;
+                    }
+                    Operation::Concat(inputs, dim) => {
+                        let mut offset = 0;
+                        for input in inputs {
+                            let len = self.nodes[input].data.shape()[dim];
+                            let grad_slice =
+                                node_grad.narrow(dim as isize, offset, len)?.contiguous()?;
+                            self.nodes[input].grad = self.nodes[input].grad.add(&grad_slice)?;
+                            offset += len;
+                        }
                     }
                 }
             }
@@ -424,6 +476,36 @@ impl Graph {
         }
         Ok(())
     }
+}
+
+/// Reduces a broadcasted gradient back to the shape of the operand it belongs
+/// to by summing over the dimensions that were broadcast during the forward
+/// pass.
+fn reduce_broadcast(
+    grad: &Tensor<CpuRuntime>,
+    target_shape: &[usize],
+) -> Result<Tensor<CpuRuntime>> {
+    if grad.shape() == target_shape {
+        return Ok(grad.clone());
+    }
+
+    let mut reduced = grad.clone();
+
+    // Drop extra leading dimensions, e.g. [T, D] -> [D].
+    while reduced.shape().len() > target_shape.len() {
+        reduced = reduced.sum(&[0], false)?;
+    }
+
+    // Sum dimensions that were broadcast from size 1, e.g. [T, D] -> [1, D].
+    let ndim = reduced.shape().len();
+    for (index, &target_dim) in target_shape.iter().enumerate() {
+        let axis = ndim - target_shape.len() + index;
+        if target_dim == 1 && reduced.shape()[axis] != 1 {
+            reduced = reduced.sum(&[axis], true)?;
+        }
+    }
+
+    Ok(reduced)
 }
 
 fn upper_triangular_mask(shape: &[usize], device: &CpuDevice) -> Result<Tensor<CpuRuntime>> {
@@ -634,6 +716,86 @@ mod tests {
 
         // Backward: Gradient should be transposed back to original shape
         assert_eq!(graph.nodes[a].grad.to_vec::<f32>(), vec![1.0; 6]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_op_concat() -> Result<()> {
+        let (device, mut graph) = setup();
+
+        let a = graph.variable(Tensor::from_slice(&[1.0_f32, 2.0], &[2, 1], &device)?)?;
+        let b = graph.variable(Tensor::from_slice(&[3.0_f32, 4.0], &[2, 1], &device)?)?;
+        let out = graph.concat(&[a, b], 1)?;
+
+        graph.backward(out)?;
+
+        // Forward: [[1], [2]] and [[3], [4]] concatenated -> [[1, 3], [2, 4]]
+        assert_eq!(
+            graph.nodes[out].data.to_vec::<f32>(),
+            vec![1.0, 3.0, 2.0, 4.0]
+        );
+        // Backward: each input receives the gradient for its own columns.
+        assert_eq!(graph.nodes[a].grad.to_vec::<f32>(), vec![1.0, 1.0]);
+        assert_eq!(graph.nodes[b].grad.to_vec::<f32>(), vec![1.0, 1.0]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_broadcast_add_bias_grad_shape() -> Result<()> {
+        let (device, mut graph) = setup();
+
+        // x is [3, 2], bias is [1, 2]. The forward add broadcasts the bias,
+        // so its gradient must be reduced back to [1, 2].
+        let x = graph.variable(Tensor::from_slice(
+            &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+            &[3, 2],
+            &device,
+        )?)?;
+        let bias = graph.variable(Tensor::from_slice(&[0.0_f32, 0.0], &[1, 2], &device)?)?;
+        let out = graph.sum(x, bias)?;
+
+        graph.backward(out)?;
+
+        assert_eq!(graph.nodes[bias].grad.shape(), &[1, 2]);
+        assert_eq!(graph.nodes[bias].grad.to_vec::<f32>(), vec![3.0, 3.0]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reset_gradients() -> Result<()> {
+        let (device, mut graph) = setup();
+
+        let a = graph.variable(Tensor::from_slice(&[1.0_f32, -2.0], &[1, 2], &device)?)?;
+        let out = graph.relu(a)?;
+
+        graph.backward(out)?;
+        assert_eq!(graph.nodes[a].grad.to_vec::<f32>(), vec![1.0, 0.0]);
+
+        graph.reset_gradients()?;
+        assert_eq!(graph.nodes[a].grad.to_vec::<f32>(), vec![0.0, 0.0]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_broadcast_scalar_mul_grad_shape() -> Result<()> {
+        let (device, mut graph) = setup();
+
+        let a = graph.variable(Tensor::from_slice(
+            &[1.0_f32, 2.0, 3.0, 4.0],
+            &[2, 2],
+            &device,
+        )?)?;
+        let scale = graph.variable(Tensor::from_slice(&[2.0_f32], &[1], &device)?)?;
+        let out = graph.mul(a, scale)?;
+
+        graph.backward(out)?;
+
+        assert_eq!(graph.nodes[scale].grad.shape(), &[1]);
+        assert_eq!(graph.nodes[scale].grad.to_vec::<f32>(), vec![10.0]);
 
         Ok(())
     }
