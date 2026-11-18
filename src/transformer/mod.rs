@@ -4,10 +4,15 @@
 //! operating on sequence-major tensors with shape `[sequence_length, model_dimension]`.
 //! The implementation features:
 //!
+//! - Learned token embeddings
 //! - Multi-head attention with a configurable number of heads
 //! - Encoder block with bidirectional self-attention and feed-forward networks
 //! - Decoder block with causal self-attention, cross-attention, and feed-forward networks
 //! - Pre-LayerNorm residual blocks
+mod embedding;
+
+pub use embedding::TokenEmbedding;
+
 use crate::autograd::{self};
 use numr::dtype::DType;
 use numr::{
@@ -504,23 +509,29 @@ fn linear(
     graph.sum(wx, b)
 }
 
+/// Generates zero-mean normal initialization values with the given standard
+/// deviation using the Box-Muller transform.
+fn normal_init(size: usize, std: f32) -> Vec<f32> {
+    let mut rng = rand::rng();
+
+    (0..size)
+        .map(|_| {
+            // Clamp to avoid `ln(0)` if the RNG ever returns exactly zero.
+            let u1: f32 = rng.random::<f32>().max(f32::MIN_POSITIVE);
+            let u2: f32 = rng.random();
+            let normal = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+            normal * std
+        })
+        .collect()
+}
+
 /// Generates Kaiming normal initialization values.
 /// Standard deviation is `sqrt(2 / fan_in)`.
 ///
 /// Used for weight initialization in linear layers.
 /// Based on He et al. 2015: "Delving Deep into Rectifiers".
 fn kaiming_init(size: usize, fan_in: usize) -> Vec<f32> {
-    let mut rng = rand::rng();
-    let std = (2.0 / fan_in as f32).sqrt();
-
-    (0..size)
-        .map(|_| {
-            let u1: f32 = rng.random();
-            let u2: f32 = rng.random();
-            let normal_std = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
-            normal_std * std
-        })
-        .collect()
+    normal_init(size, (2.0 / fan_in as f32).sqrt())
 }
 
 #[cfg(test)]
