@@ -1,4 +1,4 @@
-# Reinvent the Wheel - Transformer (1 person)
+# Reinvent the Wheel - Transformer
 
 Implement the whole Transformer (encoder and decoder) and use it on data of your choice (a toy example is good enough). Only simple primitives (e.g., linear transformation) can be reused to implement your model.
 

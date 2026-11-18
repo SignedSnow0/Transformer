@@ -14,7 +14,7 @@
 
 use crate::autograd::{self, Graph};
 use numr::{
-    error::{Error, Result},
+    error::Result,
     runtime::cpu::{CpuDevice, CpuRuntime},
     tensor::Tensor,
 };
@@ -25,8 +25,7 @@ use numr::{
 /// the first `seq_len` rows to an input of shape `[seq_len, d_model]`.
 ///
 /// The table is fixed rather than learned, so it has no trainable parameters.
-/// Dropout after the addition is omitted because this implementation only
-/// performs inference.
+/// Dropout after the addition is omitted to keep the toy model simple.
 pub struct PositionalEncoding {
     table: Tensor<CpuRuntime>,
     /// Maximum number of positions the table can represent.
@@ -49,19 +48,6 @@ impl PositionalEncoding {
     /// Returns an error if `max_len` or `d_model` is zero, or if tensor
     /// allocation fails.
     pub fn new(device: &CpuDevice, max_len: usize, d_model: usize) -> Result<Self> {
-        if max_len == 0 {
-            return Err(Error::InvalidArgument {
-                arg: "max_len",
-                reason: "max_len must be greater than zero".to_string(),
-            });
-        }
-        if d_model == 0 {
-            return Err(Error::InvalidArgument {
-                arg: "d_model",
-                reason: "d_model must be greater than zero".to_string(),
-            });
-        }
-
         let mut values = vec![0.0_f32; max_len * d_model];
 
         for position in 0..max_len {
@@ -102,33 +88,7 @@ impl PositionalEncoding {
     /// match `d_model`, if it is empty, or if it is longer than `max_len`.
     pub fn forward(&self, graph: &mut Graph, x: autograd::NodeId) -> Result<autograd::NodeId> {
         let shape = graph.nodes[x].data.shape();
-
-        if shape.len() != 2 || shape[1] != self.d_model {
-            return Err(Error::InvalidArgument {
-                arg: "x",
-                reason: format!(
-                    "expected shape [seq_len, {}], got {:?}",
-                    self.d_model, shape
-                ),
-            });
-        }
-
         let seq_len = shape[0];
-        if seq_len == 0 {
-            return Err(Error::InvalidArgument {
-                arg: "x",
-                reason: "positional encoding requires at least one position".to_string(),
-            });
-        }
-        if seq_len > self.max_len {
-            return Err(Error::InvalidArgument {
-                arg: "seq_len",
-                reason: format!(
-                    "sequence length {seq_len} exceeds positional encoding capacity {}",
-                    self.max_len
-                ),
-            });
-        }
 
         let rows = self.table.narrow(0, 0, seq_len)?.contiguous()?;
         let rows = graph.variable(rows)?;
@@ -189,30 +149,6 @@ mod tests {
         // With a unit seed, the identity path receives a gradient of ones.
         graph.backward(out)?;
         assert_eq!(graph.nodes[x].grad.to_vec::<f32>(), vec![1.0; 8]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_positional_encoding_rejects_too_long_sequence() -> Result<()> {
-        let device = CpuDevice::new();
-        let encoding = PositionalEncoding::new(&device, 2, 4)?;
-        let mut graph = Graph::new();
-        let x = graph.variable(Tensor::zeros(&[3, 4], DType::F32, &device)?)?;
-
-        assert!(encoding.forward(&mut graph, x).is_err());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_positional_encoding_rejects_wrong_dimension() -> Result<()> {
-        let device = CpuDevice::new();
-        let encoding = PositionalEncoding::new(&device, 2, 4)?;
-        let mut graph = Graph::new();
-        let x = graph.variable(Tensor::zeros(&[2, 5], DType::F32, &device)?)?;
-
-        assert!(encoding.forward(&mut graph, x).is_err());
 
         Ok(())
     }

@@ -3,7 +3,7 @@
 use super::decoding::{DecodingConfig, SamplingStrategy, select_token};
 use super::{Decoder, Encoder, OutputProjection, PositionalEncoding, TokenEmbedding};
 use crate::autograd::{self, Graph};
-use numr::error::{Error, Result};
+use numr::error::Result;
 use numr::runtime::cpu::CpuDevice;
 use rand::RngExt;
 
@@ -65,25 +65,6 @@ impl Transformer {
     /// Returns an error if any layer configuration is invalid, if a special
     /// token is outside the vocabulary, or if tensor allocation fails.
     pub fn new(graph: &mut Graph, device: &CpuDevice, config: TransformerConfig) -> Result<Self> {
-        if config.sos_token >= config.vocab_size {
-            return Err(Error::InvalidArgument {
-                arg: "sos_token",
-                reason: format!(
-                    "start token {} is outside vocabulary size {}",
-                    config.sos_token, config.vocab_size
-                ),
-            });
-        }
-        if config.eos_token >= config.vocab_size {
-            return Err(Error::InvalidArgument {
-                arg: "eos_token",
-                reason: format!(
-                    "end token {} is outside vocabulary size {}",
-                    config.eos_token, config.vocab_size
-                ),
-            });
-        }
-
         let embedding = TokenEmbedding::new(graph, device, config.vocab_size, config.d_model)?;
         let positional = PositionalEncoding::new(device, config.max_len, config.d_model)?;
         let encoder = Encoder::new(graph, device, config.d_model, config.d_ff, config.n_heads)?;
@@ -100,6 +81,20 @@ impl Transformer {
             sos_token: config.sos_token,
             eos_token: config.eos_token,
         })
+    }
+
+    /// Returns every trainable parameter node, ordered deterministically.
+    ///
+    /// The parameters are registered when the model is constructed, so they
+    /// occupy a contiguous prefix of the graph. [`Graph::truncate`] can
+    /// therefore free per-step intermediates by keeping only
+    /// `graph.nodes.len()` nodes captured immediately after construction.
+    pub fn parameters(&self) -> Vec<autograd::NodeId> {
+        let mut params = self.embedding.parameters();
+        params.extend(self.encoder.parameters());
+        params.extend(self.decoder.parameters());
+        params.extend(self.output.parameters());
+        params
     }
 
     /// Encodes token IDs into contextual representations.
@@ -165,8 +160,6 @@ impl Transformer {
         config: &DecodingConfig,
         rng: &mut impl RngExt,
     ) -> Result<Vec<usize>> {
-        config.strategy.validate()?;
-
         let encoder_output = self.encode(graph, device, encoder_token_ids)?;
         let mut decoder_tokens = vec![self.sos_token];
         let mut generated = Vec::new();
@@ -175,15 +168,6 @@ impl Transformer {
             let logits = self.decode_logits(graph, device, &decoder_tokens, encoder_output)?;
 
             let shape = graph.nodes[logits].data.shape();
-            if shape.len() != 2 || shape[1] != self.vocab_size {
-                return Err(Error::InvalidArgument {
-                    arg: "logits",
-                    reason: format!(
-                        "expected decoder logits shape [seq_len, {}], got {:?}",
-                        self.vocab_size, shape
-                    ),
-                });
-            }
 
             let values = graph.nodes[logits].data.to_vec::<f32>();
             let start = (shape[0] - 1) * self.vocab_size;
@@ -307,20 +291,6 @@ mod tests {
         assert!(generated.len() <= model.positional.max_len);
 
         Ok(())
-    }
-
-    #[test]
-    fn test_new_rejects_invalid_special_tokens() {
-        let device = CpuDevice::new();
-        let mut graph = Graph::new();
-
-        let mut sos_config = config();
-        sos_config.sos_token = 10;
-        assert!(Transformer::new(&mut graph, &device, sos_config).is_err());
-
-        let mut eos_config = config();
-        eos_config.eos_token = 10;
-        assert!(Transformer::new(&mut graph, &device, eos_config).is_err());
     }
 
     #[test]

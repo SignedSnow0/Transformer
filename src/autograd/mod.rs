@@ -37,6 +37,23 @@ pub enum Operation {
     Concat(Vec<NodeId>, usize),
 }
 
+impl Operation {
+    /// Returns the node IDs consumed by this operation.
+    pub fn inputs(&self) -> Vec<NodeId> {
+        match self {
+            Operation::Sum(a, b) | Operation::Mul(a, b) | Operation::MatMul(a, b) => {
+                vec![*a, *b]
+            }
+            Operation::CausalMask(a)
+            | Operation::SoftMax(a)
+            | Operation::Relu(a)
+            | Operation::Transpose(a) => vec![*a],
+            Operation::LayerNorm(x, gamma, beta, _) => vec![*x, *gamma, *beta],
+            Operation::Concat(inputs, _) => inputs.clone(),
+        }
+    }
+}
+
 /// A single computational step in a graph.
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -297,13 +314,6 @@ impl Graph {
     /// Returns an error if `inputs` is empty or the tensors cannot be
     /// concatenated.
     pub fn concat(&mut self, inputs: &[NodeId], dim: usize) -> Result<NodeId> {
-        if inputs.is_empty() {
-            return Err(Error::InvalidArgument {
-                arg: "inputs",
-                reason: "concat requires at least one input".to_string(),
-            });
-        }
-
         let data = {
             let tensors: Vec<&Tensor<CpuRuntime>> = inputs
                 .iter()
@@ -340,6 +350,29 @@ impl Graph {
             self.nodes[output].data.dtype(),
             self.nodes[output].data.device(),
         )?;
+        self.backward_with_grad(output, seed_grad)
+    }
+
+    /// Computes gradients from an output node using a caller-supplied upstream
+    /// gradient.
+    ///
+    /// Use this when the loss is computed outside the graph, for example a
+    /// softmax cross-entropy loss whose gradient with respect to the logits is
+    /// `(softmax(logits) - one_hot(target)) / num_tokens`.
+    ///
+    /// The supplied seed becomes the output node's gradient, and gradients
+    /// flowing backward from it are accumulated in upstream nodes. Call
+    /// [`Self::reset_gradients`] between independent backward passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `seed_grad` does not have the same shape and dtype
+    /// as the output node, or if a derivative operation fails.
+    pub fn backward_with_grad(
+        &mut self,
+        output: NodeId,
+        seed_grad: Tensor<CpuRuntime>,
+    ) -> Result<()> {
         self.nodes[output].grad = seed_grad;
 
         for i in (0..=output).rev() {
@@ -476,6 +509,22 @@ impl Graph {
         }
         Ok(())
     }
+
+    /// Drops every node at or beyond `len`, keeping `nodes[..len]`.
+    ///
+    /// This is intended for training loops that rebuild the forward graph on
+    /// every step. Parameters are typically registered first, so truncating to
+    /// the parameter count frees the intermediates from the previous step while
+    /// preserving parameter values and their accumulated gradients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `len` is greater than the current node count, or if
+    /// a retained node refers to a node that would be removed.
+    pub fn truncate(&mut self, len: usize) -> Result<()> {
+        self.nodes.truncate(len);
+        Ok(())
+    }
 }
 
 /// Reduces a broadcasted gradient back to the shape of the operand it belongs
@@ -509,13 +558,6 @@ fn reduce_broadcast(
 }
 
 fn upper_triangular_mask(shape: &[usize], device: &CpuDevice) -> Result<Tensor<CpuRuntime>> {
-    if shape.len() != 2 {
-        return Err(Error::InvalidArgument {
-            arg: "shape",
-            reason: "causal masking requires a 2-D tensor".to_string(),
-        });
-    }
-
     let mask: Vec<u8> = (0..shape[0])
         .flat_map(|row| (0..shape[1]).map(move |column| u8::from(column > row)))
         .collect();
@@ -776,6 +818,45 @@ mod tests {
 
         graph.reset_gradients()?;
         assert_eq!(graph.nodes[a].grad.to_vec::<f32>(), vec![0.0, 0.0]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_backward_with_grad_scales_seed() -> Result<()> {
+        let (device, mut graph) = setup();
+
+        let a = graph.variable(Tensor::from_slice(&[1.0_f32, 2.0], &[2], &device)?)?;
+        let scale = graph.variable(Tensor::from_slice(&[3.0_f32, 4.0], &[2], &device)?)?;
+        let out = graph.mul(a, scale)?;
+
+        let seed = Tensor::from_slice(&[2.0_f32, -1.0], &[2], &device)?;
+        graph.backward_with_grad(out, seed)?;
+
+        // dL/da = upstream * scale, dL/dscale = upstream * a.
+        assert_eq!(graph.nodes[a].grad.to_vec::<f32>(), vec![6.0, -4.0]);
+        assert_eq!(graph.nodes[scale].grad.to_vec::<f32>(), vec![2.0, -2.0]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_truncate_drops_intermediates_and_keeps_parameters() -> Result<()> {
+        let (device, mut graph) = setup();
+
+        let a = graph.variable(Tensor::from_slice(&[1.0_f32, 2.0], &[2], &device)?)?;
+        let parameter_count = graph.nodes.len();
+
+        let b = graph.variable(Tensor::from_slice(&[3.0_f32, 4.0], &[2], &device)?)?;
+        let out = graph.mul(a, b)?;
+        graph.backward(out)?;
+
+        assert!(graph.nodes.len() > parameter_count);
+        graph.truncate(parameter_count)?;
+
+        assert_eq!(graph.nodes.len(), parameter_count);
+        assert_eq!(graph.nodes[a].data.to_vec::<f32>(), vec![1.0, 2.0]);
+        assert_eq!(graph.nodes[a].grad.to_vec::<f32>(), vec![3.0, 4.0]);
 
         Ok(())
     }

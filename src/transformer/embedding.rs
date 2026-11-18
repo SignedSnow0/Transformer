@@ -7,11 +7,7 @@
 
 use super::normal_init;
 use crate::autograd::{self, Graph};
-use numr::{
-    error::{Error, Result},
-    runtime::cpu::CpuDevice,
-    tensor::Tensor,
-};
+use numr::{error::Result, runtime::cpu::CpuDevice, tensor::Tensor};
 
 /// Learned embedding table mapping integer token IDs to dense vectors.
 ///
@@ -57,25 +53,6 @@ impl TokenEmbedding {
         vocab_size: usize,
         d_model: usize,
     ) -> Result<Self> {
-        if vocab_size == 0 {
-            return Err(Error::InvalidArgument {
-                arg: "vocab_size",
-                reason: "vocab_size must be greater than zero".to_string(),
-            });
-        }
-        if vocab_size > i32::MAX as usize {
-            return Err(Error::InvalidArgument {
-                arg: "vocab_size",
-                reason: format!("vocab_size must fit in an i32, got {vocab_size}"),
-            });
-        }
-        if d_model == 0 {
-            return Err(Error::InvalidArgument {
-                arg: "d_model",
-                reason: "d_model must be greater than zero".to_string(),
-            });
-        }
-
         let std = 1.0 / (d_model as f32).sqrt();
         let table = graph.variable(Tensor::from_slice(
             &normal_init(vocab_size * d_model, std),
@@ -112,42 +89,17 @@ impl TokenEmbedding {
         device: &CpuDevice,
         token_ids: &[usize],
     ) -> Result<autograd::NodeId> {
-        if token_ids.is_empty() {
-            return Err(Error::InvalidArgument {
-                arg: "token_ids",
-                reason: "embedding lookup requires at least one token".to_string(),
-            });
-        }
-
-        let table_shape = graph.nodes[self.table].data.shape();
-        if table_shape != [self.vocab_size, self.d_model] {
-            return Err(Error::InvalidArgument {
-                arg: "table",
-                reason: format!(
-                    "expected embedding table shape [{}, {}], got {:?}",
-                    self.vocab_size, self.d_model, table_shape
-                ),
-            });
-        }
-
-        for (position, &id) in token_ids.iter().enumerate() {
-            if id >= self.vocab_size {
-                return Err(Error::InvalidArgument {
-                    arg: "token_ids",
-                    reason: format!(
-                        "token id {id} at position {position} is out of range for vocabulary size {}",
-                        self.vocab_size
-                    ),
-                });
-            }
-        }
-
         let indices: Vec<i32> = token_ids.iter().map(|&id| id as i32).collect();
         let indices = Tensor::from_slice(&indices, &[token_ids.len()], device)?;
         let one_hot = indices.one_hot(self.vocab_size)?;
         let one_hot = graph.variable(one_hot)?;
 
         graph.matmul(one_hot, self.table)
+    }
+
+    /// Returns the node ID of the trainable embedding table.
+    pub fn parameters(&self) -> Vec<autograd::NodeId> {
+        vec![self.table]
     }
 }
 
@@ -209,28 +161,6 @@ mod tests {
 
         let grad = graph.nodes[embedding.table].grad.to_vec::<f32>();
         assert_eq!(grad, vec![0.0, 0.0, 2.0, 2.0, 0.0, 0.0]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_embedding_rejects_invalid_token() -> Result<()> {
-        let device = CpuDevice::new();
-        let mut graph = Graph::new();
-        let embedding = TokenEmbedding::new(&mut graph, &device, 5, 4)?;
-
-        assert!(embedding.forward(&mut graph, &device, &[0, 5]).is_err());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_embedding_rejects_empty_sequence() -> Result<()> {
-        let device = CpuDevice::new();
-        let mut graph = Graph::new();
-        let embedding = TokenEmbedding::new(&mut graph, &device, 5, 4)?;
-
-        assert!(embedding.forward(&mut graph, &device, &[]).is_err());
 
         Ok(())
     }

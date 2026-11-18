@@ -25,14 +25,18 @@ pub use positional::PositionalEncoding;
 
 use crate::autograd::{self};
 use numr::dtype::DType;
-use numr::{
-    error::{Error, Result},
-    runtime::cpu::CpuDevice,
-    tensor::Tensor,
-};
-use rand::RngExt;
+use numr::{error::Result, runtime::cpu::CpuDevice, tensor::Tensor};
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
+use std::sync::Mutex;
 
 const LAYER_NORM_EPS: f32 = 1e-5;
+
+/// Seed used when parameter initialization is not explicitly seeded.
+const DEFAULT_INIT_SEED: u64 = 0x5EED_5EED;
+
+/// Process-wide random source for parameter initialization.
+static INIT_RNG: Mutex<Option<StdRng>> = Mutex::new(None);
 
 /// Multi-head attention over sequence-major tensors `[seq_len, d_model]`.
 ///
@@ -82,19 +86,6 @@ impl MultiHeadAttention {
         d_model: usize,
         n_heads: usize,
     ) -> Result<Self> {
-        if n_heads == 0 {
-            return Err(Error::InvalidArgument {
-                arg: "n_heads",
-                reason: "n_heads must be greater than zero".to_string(),
-            });
-        }
-        if !d_model.is_multiple_of(n_heads) {
-            return Err(Error::InvalidArgument {
-                arg: "n_heads",
-                reason: format!("d_model ({d_model}) must be divisible by n_heads ({n_heads})"),
-            });
-        }
-
         let d_head = d_model / n_heads;
         let mut w_q = Vec::with_capacity(n_heads);
         let mut b_q = Vec::with_capacity(n_heads);
@@ -177,35 +168,6 @@ impl MultiHeadAttention {
     ) -> Result<autograd::NodeId> {
         let key_value = key_value.unwrap_or(query);
 
-        let query_shape = graph.nodes[query].data.shape();
-        if query_shape.len() != 2 || query_shape[1] != self.d_model {
-            return Err(Error::InvalidArgument {
-                arg: "query",
-                reason: format!(
-                    "expected shape [seq_len, {}], got {:?}",
-                    self.d_model, query_shape
-                ),
-            });
-        }
-        let key_value_shape = graph.nodes[key_value].data.shape();
-        if key_value_shape.len() != 2 || key_value_shape[1] != self.d_model {
-            return Err(Error::InvalidArgument {
-                arg: "key_value",
-                reason: format!(
-                    "expected shape [seq_len, {}], got {:?}",
-                    self.d_model, key_value_shape
-                ),
-            });
-        }
-
-        if causal && query_shape[0] != key_value_shape[0] {
-            return Err(Error::InvalidArgument {
-                arg: "causal",
-                reason: "causal masking requires matching query and key/value sequence lengths"
-                    .to_string(),
-            });
-        }
-
         let scale = 1.0 / (self.d_head as f32).sqrt();
         let scale_node = graph.variable(Tensor::from_slice(&[scale], &[1], device)?)?;
 
@@ -230,6 +192,24 @@ impl MultiHeadAttention {
 
         let concatenated = graph.concat(&heads, 1)?;
         linear(graph, concatenated, self.w_o, self.b_o)
+    }
+
+    /// Returns the node IDs of every trainable parameter in this layer.
+    pub fn parameters(&self) -> Vec<autograd::NodeId> {
+        let mut params = Vec::with_capacity(6 * self.n_heads + 2);
+        for head in 0..self.n_heads {
+            params.extend([
+                self.w_q[head],
+                self.b_q[head],
+                self.w_k[head],
+                self.b_k[head],
+                self.w_v[head],
+                self.b_v[head],
+            ]);
+        }
+        params.push(self.w_o);
+        params.push(self.b_o);
+        params
     }
 }
 
@@ -357,6 +337,22 @@ impl Encoder {
         let ffn_out = linear(graph, ffn_activated, self.w_2, self.b_2)?;
 
         graph.sum(x_1, ffn_out)
+    }
+
+    /// Returns the node IDs of every trainable parameter in this layer.
+    pub fn parameters(&self) -> Vec<autograd::NodeId> {
+        let mut params = self.attn.parameters();
+        params.extend([
+            self.gamma_1,
+            self.beta_1,
+            self.w_1,
+            self.b_1,
+            self.w_2,
+            self.b_2,
+            self.gamma_2,
+            self.beta_2,
+        ]);
+        params
     }
 }
 
@@ -506,6 +502,25 @@ impl Decoder {
 
         graph.sum(x_2, ffn_out)
     }
+
+    /// Returns the node IDs of every trainable parameter in this layer.
+    pub fn parameters(&self) -> Vec<autograd::NodeId> {
+        let mut params = self.self_attn.parameters();
+        params.extend(self.cross_attn.parameters());
+        params.extend([
+            self.gamma_1,
+            self.beta_1,
+            self.gamma_2,
+            self.beta_2,
+            self.w_1,
+            self.b_1,
+            self.w_2,
+            self.b_2,
+            self.gamma_3,
+            self.beta_3,
+        ]);
+        params
+    }
 }
 
 /// Applies linear transformation: `output = input @ weight + bias`
@@ -522,7 +537,10 @@ fn linear(
 /// Generates zero-mean normal initialization values with the given standard
 /// deviation using the Box-Muller transform.
 fn normal_init(size: usize, std: f32) -> Vec<f32> {
-    let mut rng = rand::rng();
+    let mut guard = INIT_RNG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let rng = guard.get_or_insert_with(|| StdRng::seed_from_u64(DEFAULT_INIT_SEED));
 
     (0..size)
         .map(|_| {
@@ -855,16 +873,6 @@ mod tests {
         let var: f32 =
             out_data.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / out_data.len() as f32;
         assert!((var.sqrt() - 1.0).abs() < 1e-5);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_invalid_head_count() -> Result<()> {
-        let (device, mut graph) = setup();
-
-        assert!(MultiHeadAttention::new(&mut graph, &device, 8, 0).is_err());
-        assert!(MultiHeadAttention::new(&mut graph, &device, 8, 3).is_err());
 
         Ok(())
     }

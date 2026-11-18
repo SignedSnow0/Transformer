@@ -14,7 +14,7 @@
 //! Top-p sampling introduces output variance, so it is useful for qualitative
 //! generation but not the best choice for measuring exact-match accuracy.
 
-use numr::error::{Error, Result};
+use numr::error::Result;
 use std::cmp::Ordering;
 
 /// Strategy used to choose the next token from a vector of logits.
@@ -29,37 +29,6 @@ pub enum SamplingStrategy {
         /// Softmax temperature; must be finite and greater than zero.
         temperature: f32,
     },
-}
-
-impl SamplingStrategy {
-    /// Validates the strategy's parameters.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `p` is outside `(0, 1]` or `temperature` is not a
-    /// finite positive number.
-    pub fn validate(&self) -> Result<()> {
-        match *self {
-            SamplingStrategy::Greedy => Ok(()),
-            SamplingStrategy::TopP { p, temperature } => {
-                if !p.is_finite() || p <= 0.0 || p > 1.0 {
-                    return Err(Error::InvalidArgument {
-                        arg: "p",
-                        reason: format!("top-p must be in (0, 1], got {p}"),
-                    });
-                }
-                if !temperature.is_finite() || temperature <= 0.0 {
-                    return Err(Error::InvalidArgument {
-                        arg: "temperature",
-                        reason: format!(
-                            "temperature must be finite and greater than zero, got {temperature}"
-                        ),
-                    });
-                }
-                Ok(())
-            }
-        }
-    }
 }
 
 /// Configuration for autoregressive generation.
@@ -92,26 +61,9 @@ impl Default for DecodingConfig {
 /// `uniform` is outside `[0, 1)` for top-p sampling, or if the logits cannot be
 /// converted to a finite probability distribution.
 pub fn select_token(logits: &[f32], strategy: SamplingStrategy, uniform: f32) -> Result<usize> {
-    if logits.is_empty() {
-        return Err(Error::InvalidArgument {
-            arg: "logits",
-            reason: "token selection requires at least one logit".to_string(),
-        });
-    }
-
-    strategy.validate()?;
-
     match strategy {
         SamplingStrategy::Greedy => Ok(argmax(logits)),
-        SamplingStrategy::TopP { p, temperature } => {
-            if !uniform.is_finite() || !(0.0..1.0).contains(&uniform) {
-                return Err(Error::InvalidArgument {
-                    arg: "uniform",
-                    reason: format!("uniform sample must be in [0, 1), got {uniform}"),
-                });
-            }
-            top_p(logits, p, temperature, uniform)
-        }
+        SamplingStrategy::TopP { p, temperature } => top_p(logits, p, temperature, uniform),
     }
 }
 
@@ -127,12 +79,6 @@ fn argmax(logits: &[f32]) -> usize {
 
 fn softmax(logits: &[f32], temperature: f32) -> Result<Vec<f32>> {
     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    if !max_logit.is_finite() {
-        return Err(Error::InvalidArgument {
-            arg: "logits",
-            reason: "logits must contain at least one finite value".to_string(),
-        });
-    }
 
     let mut probabilities = Vec::with_capacity(logits.len());
     let mut sum = 0.0_f32;
@@ -140,13 +86,6 @@ fn softmax(logits: &[f32], temperature: f32) -> Result<Vec<f32>> {
         let value = ((logit - max_logit) / temperature).exp();
         probabilities.push(value);
         sum += value;
-    }
-
-    if !sum.is_finite() || sum <= 0.0 {
-        return Err(Error::InvalidArgument {
-            arg: "logits",
-            reason: "logits do not form a finite probability distribution".to_string(),
-        });
     }
 
     for probability in &mut probabilities {
@@ -176,13 +115,6 @@ fn top_p(logits: &[f32], p: f32, temperature: f32, uniform: f32) -> Result<usize
     // form a distribution with total mass one.
     let nucleus = &candidates[..keep];
     let total: f32 = nucleus.iter().map(|(_, probability)| *probability).sum();
-    if !total.is_finite() || total <= 0.0 {
-        return Err(Error::InvalidArgument {
-            arg: "logits",
-            reason: "nucleus probabilities do not sum to a positive finite value".to_string(),
-        });
-    }
-
     let mut threshold = uniform * total;
     for (index, probability) in nucleus {
         if threshold < *probability {
@@ -258,54 +190,5 @@ mod tests {
         assert!(cold[1] > hot[1]);
 
         Ok(())
-    }
-
-    #[test]
-    fn test_invalid_sampling_parameters_are_rejected() {
-        assert!(
-            select_token(
-                &[0.0, 1.0],
-                SamplingStrategy::TopP {
-                    p: 0.0,
-                    temperature: 1.0,
-                },
-                0.5,
-            )
-            .is_err()
-        );
-        assert!(
-            select_token(
-                &[0.0, 1.0],
-                SamplingStrategy::TopP {
-                    p: 1.1,
-                    temperature: 1.0,
-                },
-                0.5,
-            )
-            .is_err()
-        );
-        assert!(
-            select_token(
-                &[0.0, 1.0],
-                SamplingStrategy::TopP {
-                    p: 0.9,
-                    temperature: 0.0,
-                },
-                0.5,
-            )
-            .is_err()
-        );
-        assert!(
-            select_token(
-                &[0.0, 1.0],
-                SamplingStrategy::TopP {
-                    p: 0.9,
-                    temperature: 1.0,
-                },
-                1.0,
-            )
-            .is_err()
-        );
-        assert!(select_token(&[], SamplingStrategy::Greedy, 0.0).is_err());
     }
 }

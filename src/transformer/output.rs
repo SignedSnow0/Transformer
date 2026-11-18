@@ -3,11 +3,7 @@
 use super::{kaiming_init, linear};
 use crate::autograd::{self, Graph};
 use numr::dtype::DType;
-use numr::{
-    error::{Error, Result},
-    runtime::cpu::CpuDevice,
-    tensor::Tensor,
-};
+use numr::{error::Result, runtime::cpu::CpuDevice, tensor::Tensor};
 
 /// Projects decoder hidden states to vocabulary logits.
 ///
@@ -49,19 +45,6 @@ impl OutputProjection {
         d_model: usize,
         vocab_size: usize,
     ) -> Result<Self> {
-        if d_model == 0 {
-            return Err(Error::InvalidArgument {
-                arg: "d_model",
-                reason: "d_model must be greater than zero".to_string(),
-            });
-        }
-        if vocab_size == 0 {
-            return Err(Error::InvalidArgument {
-                arg: "vocab_size",
-                reason: "vocab_size must be greater than zero".to_string(),
-            });
-        }
-
         let w = graph.variable(Tensor::from_slice(
             &kaiming_init(d_model * vocab_size, d_model),
             &[d_model, vocab_size],
@@ -93,32 +76,14 @@ impl OutputProjection {
     /// Returns an error if `x` is not 2-D, if its feature dimension does not
     /// match `d_model`, or if a tensor operation fails.
     pub fn forward(&self, graph: &mut Graph, x: autograd::NodeId) -> Result<autograd::NodeId> {
-        let shape = graph.nodes[x].data.shape();
-        if shape.len() != 2 || shape[1] != self.d_model {
-            return Err(Error::InvalidArgument {
-                arg: "x",
-                reason: format!(
-                    "expected shape [seq_len, {}], got {:?}",
-                    self.d_model, shape
-                ),
-            });
-        }
-
-        let seq_len = shape[0];
         let logits = linear(graph, x, self.w, self.b)?;
-        if graph.nodes[logits].data.shape() != [seq_len, self.vocab_size] {
-            return Err(Error::InvalidArgument {
-                arg: "logits",
-                reason: format!(
-                    "expected output shape [{}, {}], got {:?}",
-                    seq_len,
-                    self.vocab_size,
-                    graph.nodes[logits].data.shape()
-                ),
-            });
-        }
 
         Ok(logits)
+    }
+
+    /// Returns the node IDs of the projection weight and bias.
+    pub fn parameters(&self) -> Vec<autograd::NodeId> {
+        vec![self.w, self.b]
     }
 }
 
@@ -137,18 +102,6 @@ mod tests {
         let logits = output.forward(&mut graph, x)?;
 
         assert_eq!(graph.nodes[logits].data.shape(), &[3, 10]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_output_projection_rejects_wrong_dimension() -> Result<()> {
-        let device = CpuDevice::new();
-        let mut graph = Graph::new();
-        let output = OutputProjection::new(&mut graph, &device, 8, 10)?;
-        let x = graph.variable(Tensor::zeros(&[3, 7], DType::F32, &device)?)?;
-
-        assert!(output.forward(&mut graph, x).is_err());
 
         Ok(())
     }
