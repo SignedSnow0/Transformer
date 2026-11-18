@@ -5,13 +5,23 @@
 //! The implementation features:
 //!
 //! - Learned token embeddings
+//! - Fixed sinusoidal positional encoding
 //! - Multi-head attention with a configurable number of heads
 //! - Encoder block with bidirectional self-attention and feed-forward networks
 //! - Decoder block with causal self-attention, cross-attention, and feed-forward networks
+//! - Vocabulary projection and greedy/top-p decoding
 //! - Pre-LayerNorm residual blocks
+mod decoding;
 mod embedding;
+mod model;
+mod output;
+mod positional;
 
+pub use decoding::{DecodingConfig, SamplingStrategy};
 pub use embedding::TokenEmbedding;
+pub use model::{Transformer, TransformerConfig};
+pub use output::OutputProjection;
+pub use positional::PositionalEncoding;
 
 use crate::autograd::{self};
 use numr::dtype::DType;

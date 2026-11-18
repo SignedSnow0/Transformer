@@ -1,0 +1,187 @@
+//! Vocabulary projection for decoder outputs.
+
+use super::{kaiming_init, linear};
+use crate::autograd::{self, Graph};
+use numr::dtype::DType;
+use numr::{
+    error::{Error, Result},
+    runtime::cpu::CpuDevice,
+    tensor::Tensor,
+};
+
+/// Projects decoder hidden states to vocabulary logits.
+///
+/// The projection is a linear layer with weight `[d_model, vocab_size]` and
+/// bias `[1, vocab_size]`. Applying [`Graph::softmax`] to the returned logits
+/// yields next-token probabilities.
+///
+/// The weight is initialized with Kaiming normal initialization. Weight tying
+/// with [`super::TokenEmbedding`] is not performed here; the two tables are
+/// independent parameters.
+pub struct OutputProjection {
+    /// Weight node with shape `[d_model, vocab_size]`.
+    pub w: autograd::NodeId,
+    /// Bias node with shape `[1, vocab_size]`.
+    pub b: autograd::NodeId,
+    /// Hidden-state dimension of the decoder.
+    pub d_model: usize,
+    /// Number of output tokens.
+    pub vocab_size: usize,
+}
+
+impl OutputProjection {
+    /// Creates a randomly initialized vocabulary projection.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph` - Autograd graph to register parameters in
+    /// * `device` - CPU device for tensor allocation
+    /// * `d_model` - Decoder hidden-state dimension
+    /// * `vocab_size` - Number of output tokens
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `d_model` or `vocab_size` is zero, or if tensor
+    /// allocation fails.
+    pub fn new(
+        graph: &mut Graph,
+        device: &CpuDevice,
+        d_model: usize,
+        vocab_size: usize,
+    ) -> Result<Self> {
+        if d_model == 0 {
+            return Err(Error::InvalidArgument {
+                arg: "d_model",
+                reason: "d_model must be greater than zero".to_string(),
+            });
+        }
+        if vocab_size == 0 {
+            return Err(Error::InvalidArgument {
+                arg: "vocab_size",
+                reason: "vocab_size must be greater than zero".to_string(),
+            });
+        }
+
+        let w = graph.variable(Tensor::from_slice(
+            &kaiming_init(d_model * vocab_size, d_model),
+            &[d_model, vocab_size],
+            device,
+        )?)?;
+        let b = graph.variable(Tensor::zeros(&[1, vocab_size], DType::F32, device)?)?;
+
+        Ok(Self {
+            w,
+            b,
+            d_model,
+            vocab_size,
+        })
+    }
+
+    /// Maps hidden states to vocabulary logits.
+    ///
+    /// # Arguments
+    ///
+    /// * `graph` - Autograd graph to build the projection in
+    /// * `x` - Decoder hidden states with shape `[seq_len, d_model]`
+    ///
+    /// # Returns
+    ///
+    /// Node ID of logits with shape `[seq_len, vocab_size]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `x` is not 2-D, if its feature dimension does not
+    /// match `d_model`, or if a tensor operation fails.
+    pub fn forward(&self, graph: &mut Graph, x: autograd::NodeId) -> Result<autograd::NodeId> {
+        let shape = graph.nodes[x].data.shape();
+        if shape.len() != 2 || shape[1] != self.d_model {
+            return Err(Error::InvalidArgument {
+                arg: "x",
+                reason: format!(
+                    "expected shape [seq_len, {}], got {:?}",
+                    self.d_model, shape
+                ),
+            });
+        }
+
+        let seq_len = shape[0];
+        let logits = linear(graph, x, self.w, self.b)?;
+        if graph.nodes[logits].data.shape() != [seq_len, self.vocab_size] {
+            return Err(Error::InvalidArgument {
+                arg: "logits",
+                reason: format!(
+                    "expected output shape [{}, {}], got {:?}",
+                    seq_len,
+                    self.vocab_size,
+                    graph.nodes[logits].data.shape()
+                ),
+            });
+        }
+
+        Ok(logits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transformer::TokenEmbedding;
+
+    #[test]
+    fn test_output_projection_shape() -> Result<()> {
+        let device = CpuDevice::new();
+        let mut graph = Graph::new();
+        let output = OutputProjection::new(&mut graph, &device, 8, 10)?;
+        let x = graph.variable(Tensor::zeros(&[3, 8], DType::F32, &device)?)?;
+
+        let logits = output.forward(&mut graph, x)?;
+
+        assert_eq!(graph.nodes[logits].data.shape(), &[3, 10]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_output_projection_rejects_wrong_dimension() -> Result<()> {
+        let device = CpuDevice::new();
+        let mut graph = Graph::new();
+        let output = OutputProjection::new(&mut graph, &device, 8, 10)?;
+        let x = graph.variable(Tensor::zeros(&[3, 7], DType::F32, &device)?)?;
+
+        assert!(output.forward(&mut graph, x).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_output_projection_backward_reaches_weights() -> Result<()> {
+        let device = CpuDevice::new();
+        let mut graph = Graph::new();
+        let d_model = 4;
+        let vocab_size = 6;
+        let output = OutputProjection::new(&mut graph, &device, d_model, vocab_size)?;
+        let embedding = TokenEmbedding::new(&mut graph, &device, vocab_size, d_model)?;
+
+        let embedded = embedding.forward(&mut graph, &device, &[0, 1, 2])?;
+        let logits = output.forward(&mut graph, embedded)?;
+        let loss = graph.mul(logits, logits)?;
+        graph.backward(loss)?;
+
+        assert!(
+            graph.nodes[output.w]
+                .grad
+                .to_vec::<f32>()
+                .iter()
+                .any(|&gradient| gradient.abs() > 1e-8)
+        );
+        assert!(
+            graph.nodes[output.b]
+                .grad
+                .to_vec::<f32>()
+                .iter()
+                .any(|&gradient| gradient.abs() > 1e-8)
+        );
+
+        Ok(())
+    }
+}
