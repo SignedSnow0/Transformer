@@ -2,8 +2,7 @@
 
 use super::{kaiming_init, linear};
 use crate::autograd::{self, Graph};
-use numr::dtype::DType;
-use numr::{error::Result, runtime::cpu::CpuDevice, tensor::Tensor};
+use numr::prelude::*;
 
 /// Projects decoder hidden states to vocabulary logits.
 ///
@@ -19,10 +18,6 @@ pub struct OutputProjection {
     pub w: autograd::NodeId,
     /// Bias node with shape `[1, vocab_size]`.
     pub b: autograd::NodeId,
-    /// Hidden-state dimension of the decoder.
-    pub d_model: usize,
-    /// Number of output tokens.
-    pub vocab_size: usize,
 }
 
 impl OutputProjection {
@@ -31,7 +26,7 @@ impl OutputProjection {
     /// # Arguments
     ///
     /// * `graph` - Autograd graph to register parameters in
-    /// * `device` - CPU device for tensor allocation
+    /// * `device` - Device for tensor allocation
     /// * `d_model` - Decoder hidden-state dimension
     /// * `vocab_size` - Number of output tokens
     ///
@@ -39,12 +34,16 @@ impl OutputProjection {
     ///
     /// Returns an error if `d_model` or `vocab_size` is zero, or if tensor
     /// allocation fails.
-    pub fn new(
-        graph: &mut Graph,
-        device: &CpuDevice,
+    pub fn new<R>(
+        graph: &mut Graph<R>,
+        device: &R::Device,
         d_model: usize,
         vocab_size: usize,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    {
         let w = graph.variable(Tensor::from_slice(
             &kaiming_init(d_model * vocab_size, d_model),
             &[d_model, vocab_size],
@@ -52,12 +51,7 @@ impl OutputProjection {
         )?)?;
         let b = graph.variable(Tensor::zeros(&[1, vocab_size], DType::F32, device)?)?;
 
-        Ok(Self {
-            w,
-            b,
-            d_model,
-            vocab_size,
-        })
+        Ok(Self { w, b })
     }
 
     /// Maps hidden states to vocabulary logits.
@@ -75,15 +69,14 @@ impl OutputProjection {
     ///
     /// Returns an error if `x` is not 2-D, if its feature dimension does not
     /// match `d_model`, or if a tensor operation fails.
-    pub fn forward(&self, graph: &mut Graph, x: autograd::NodeId) -> Result<autograd::NodeId> {
+    pub fn forward<R>(&self, graph: &mut Graph<R>, x: autograd::NodeId) -> Result<autograd::NodeId>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    {
         let logits = linear(graph, x, self.w, self.b)?;
 
         Ok(logits)
-    }
-
-    /// Returns the node IDs of the projection weight and bias.
-    pub fn parameters(&self) -> Vec<autograd::NodeId> {
-        vec![self.w, self.b]
     }
 }
 
@@ -91,11 +84,12 @@ impl OutputProjection {
 mod tests {
     use super::*;
     use crate::transformer::TokenEmbedding;
+    use numr::runtime::cpu::CpuDevice;
 
     #[test]
     fn test_output_projection_shape() -> Result<()> {
         let device = CpuDevice::new();
-        let mut graph = Graph::new();
+        let mut graph = Graph::<numr::runtime::cpu::CpuRuntime>::new();
         let output = OutputProjection::new(&mut graph, &device, 8, 10)?;
         let x = graph.variable(Tensor::zeros(&[3, 8], DType::F32, &device)?)?;
 
@@ -109,7 +103,7 @@ mod tests {
     #[test]
     fn test_output_projection_backward_reaches_weights() -> Result<()> {
         let device = CpuDevice::new();
-        let mut graph = Graph::new();
+        let mut graph = Graph::<numr::runtime::cpu::CpuRuntime>::new();
         let d_model = 4;
         let vocab_size = 6;
         let output = OutputProjection::new(&mut graph, &device, d_model, vocab_size)?;
@@ -118,7 +112,7 @@ mod tests {
         let embedded = embedding.forward(&mut graph, &device, &[0, 1, 2])?;
         let logits = output.forward(&mut graph, embedded)?;
         let loss = graph.mul(logits, logits)?;
-        graph.backward(loss)?;
+        graph.backward_with_grad(loss, Tensor::ones(&[3, vocab_size], DType::F32, &device)?)?;
 
         assert!(
             graph.nodes[output.w]

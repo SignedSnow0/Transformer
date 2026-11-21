@@ -1,10 +1,10 @@
 //! A small reverse-mode automatic differentiation engine for computational graphs.
 //!
 //! [`Graph`] stores intermediate tensors and the [`Operation`] that produced
-//! them. [`Graph::backward`] walks those nodes in reverse order and accumulates
-//! gradients in [`Node::grad`].
+//! them. [`Graph::backward_with_grad`] walks those nodes in reverse order and
+//! accumulates gradients in [`Node::grad`].
 use numr::prelude::*;
-use numr::runtime::cpu::CpuDevice;
+use numr::runtime::cpu::CpuRuntime;
 
 /// Reference to a node in a [`Graph`].
 ///
@@ -37,46 +37,45 @@ pub enum Operation {
     Concat(Vec<NodeId>, usize),
 }
 
-impl Operation {
-    /// Returns the node IDs consumed by this operation.
-    pub fn inputs(&self) -> Vec<NodeId> {
-        match self {
-            Operation::Sum(a, b) | Operation::Mul(a, b) | Operation::MatMul(a, b) => {
-                vec![*a, *b]
-            }
-            Operation::CausalMask(a)
-            | Operation::SoftMax(a)
-            | Operation::Relu(a)
-            | Operation::Transpose(a) => vec![*a],
-            Operation::LayerNorm(x, gamma, beta, _) => vec![*x, *gamma, *beta],
-            Operation::Concat(inputs, _) => inputs.clone(),
-        }
-    }
-}
-
 /// A single computational step in a graph.
 #[derive(Debug, Clone)]
-pub struct Node {
+pub struct Node<R: Runtime = CpuRuntime> {
     /// Tensor produced by the forward pass.
-    pub data: Tensor<CpuRuntime>,
+    pub data: Tensor<R>,
     /// Gradient accumulated during the backward pass.
-    pub grad: Tensor<CpuRuntime>,
+    pub grad: Tensor<R>,
     /// Operation that produced `data`, or `None` for an input variable.
     pub op: Option<Operation>,
 }
 
 /// Computational graph used for forward evaluation and reverse-mode autodiff.
-pub struct Graph {
+///
+/// The runtime defaults to the CPU so unit tests and small examples can run
+/// without a GPU; applications choose another backend by spelling the type,
+/// for example `Graph<WgpuRuntime>`.
+pub struct Graph<R: Runtime = CpuRuntime> {
     /// Nodes in insertion order, addressable by [`NodeId`].
-    pub nodes: Vec<Node>,
+    pub nodes: Vec<Node<R>>,
 }
 
-impl Graph {
+impl<R: Runtime> Default for Graph<R> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<R: Runtime> Graph<R> {
     /// Creates an empty computational graph.
     pub fn new() -> Self {
         Graph { nodes: Vec::new() }
     }
+}
 
+impl<R> Graph<R>
+where
+    R: Runtime<DType = DType>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+{
     /// Adds a leaf tensor to the graph.
     ///
     /// The new node starts with a zero gradient and no producing operation.
@@ -84,7 +83,7 @@ impl Graph {
     /// # Errors
     ///
     /// Returns an error if the gradient tensor cannot be allocated.
-    pub fn variable(&mut self, data: Tensor<CpuRuntime>) -> Result<NodeId> {
+    pub fn variable(&mut self, data: Tensor<R>) -> Result<NodeId> {
         let shape = data.shape().to_vec();
         let dtype = data.dtype();
         let device = data.device();
@@ -177,8 +176,13 @@ impl Graph {
     /// Returns an error if the input is not 2-D or a tensor operation fails.
     pub fn causal_mask(&mut self, a: NodeId) -> Result<NodeId> {
         let node_a = &self.nodes[a];
-        let upper_mask = upper_triangular_mask(node_a.data.shape(), node_a.data.device())?;
-        let data = node_a.data.masked_fill(&upper_mask, f64::NEG_INFINITY)?;
+        let offset = triangular_mask(
+            node_a.data.shape(),
+            0.0,
+            f32::NEG_INFINITY,
+            node_a.data.device(),
+        )?;
+        let data = node_a.data.add(&offset)?;
 
         let grad = Tensor::zeros(data.shape(), data.dtype(), data.device())?;
 
@@ -315,7 +319,7 @@ impl Graph {
     /// concatenated.
     pub fn concat(&mut self, inputs: &[NodeId], dim: usize) -> Result<NodeId> {
         let data = {
-            let tensors: Vec<&Tensor<CpuRuntime>> = inputs
+            let tensors: Vec<&Tensor<R>> = inputs
                 .iter()
                 .map(|&input| &self.nodes[input].data)
                 .collect();
@@ -333,26 +337,6 @@ impl Graph {
         Ok(self.nodes.len() - 1)
     }
 
-    /// Computes gradients from an output node back through the graph.
-    ///
-    /// The output gradient is initialized to ones, and each node's gradient is
-    /// accumulated in [`Node::grad`]. Call [`Self::reset_gradients`] before a
-    /// new backward pass when gradients from an earlier pass should not be
-    /// retained.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any derivative operation or gradient accumulation
-    /// fails.
-    pub fn backward(&mut self, output: NodeId) -> Result<()> {
-        let seed_grad = Tensor::ones(
-            self.nodes[output].data.shape(),
-            self.nodes[output].data.dtype(),
-            self.nodes[output].data.device(),
-        )?;
-        self.backward_with_grad(output, seed_grad)
-    }
-
     /// Computes gradients from an output node using a caller-supplied upstream
     /// gradient.
     ///
@@ -361,18 +345,14 @@ impl Graph {
     /// `(softmax(logits) - one_hot(target)) / num_tokens`.
     ///
     /// The supplied seed becomes the output node's gradient, and gradients
-    /// flowing backward from it are accumulated in upstream nodes. Call
-    /// [`Self::reset_gradients`] between independent backward passes.
+    /// flowing backward from it are accumulated in upstream nodes. Use a fresh
+    /// graph for each independent backward pass.
     ///
     /// # Errors
     ///
     /// Returns an error if `seed_grad` does not have the same shape and dtype
     /// as the output node, or if a derivative operation fails.
-    pub fn backward_with_grad(
-        &mut self,
-        output: NodeId,
-        seed_grad: Tensor<CpuRuntime>,
-    ) -> Result<()> {
+    pub fn backward_with_grad(&mut self, output: NodeId, seed_grad: Tensor<R>) -> Result<()> {
         self.nodes[output].grad = seed_grad;
 
         for i in (0..=output).rev() {
@@ -414,9 +394,9 @@ impl Graph {
                     }
                     Operation::CausalMask(a) => {
                         let node_a = &self.nodes[a];
-                        let upper_mask =
-                            upper_triangular_mask(node_a.data.shape(), node_a.data.device())?;
-                        let masked_grad = node_grad.masked_fill(&upper_mask, 0.0)?;
+                        let keep =
+                            triangular_mask(node_a.data.shape(), 1.0, 0.0, node_a.data.device())?;
+                        let masked_grad = node_grad.mul(&keep)?;
 
                         self.nodes[a].grad = self.nodes[a].grad.add(&masked_grad)?;
                     }
@@ -495,21 +475,6 @@ impl Graph {
         Ok(())
     }
 
-    /// Clears every node's accumulated gradient.
-    ///
-    /// Call this before starting an independent backward pass to avoid
-    /// accumulating gradients from earlier passes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a zero-filled gradient tensor cannot be allocated.
-    pub fn reset_gradients(&mut self) -> Result<()> {
-        for node in &mut self.nodes {
-            node.grad = Tensor::zeros(node.data.shape(), node.data.dtype(), node.data.device())?;
-        }
-        Ok(())
-    }
-
     /// Drops every node at or beyond `len`, keeping `nodes[..len]`.
     ///
     /// This is intended for training loops that rebuild the forward graph on
@@ -530,10 +495,11 @@ impl Graph {
 /// Reduces a broadcasted gradient back to the shape of the operand it belongs
 /// to by summing over the dimensions that were broadcast during the forward
 /// pass.
-fn reduce_broadcast(
-    grad: &Tensor<CpuRuntime>,
-    target_shape: &[usize],
-) -> Result<Tensor<CpuRuntime>> {
+fn reduce_broadcast<R>(grad: &Tensor<R>, target_shape: &[usize]) -> Result<Tensor<R>>
+where
+    R: Runtime<DType = DType>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+{
     if grad.shape() == target_shape {
         return Ok(grad.clone());
     }
@@ -557,9 +523,23 @@ fn reduce_broadcast(
     Ok(reduced)
 }
 
-fn upper_triangular_mask(shape: &[usize], device: &CpuDevice) -> Result<Tensor<CpuRuntime>> {
-    let mask: Vec<u8> = (0..shape[0])
-        .flat_map(|row| (0..shape[1]).map(move |column| u8::from(column > row)))
+/// Builds a 2-D mask with `lower` on the diagonal/lower triangle and `upper`
+/// in the strict upper triangle.
+///
+/// The mask is materialized as an `f32` tensor so the same code works on every
+/// backend: CPU `masked_fill` expects `u8` masks while the WebGPU implementation
+/// only accepts `u32`, but ordinary arithmetic on `f32` is portable.
+fn triangular_mask<R>(
+    shape: &[usize],
+    lower: f32,
+    upper: f32,
+    device: &R::Device,
+) -> Result<Tensor<R>>
+where
+    R: Runtime<DType = DType>,
+{
+    let mask: Vec<f32> = (0..shape[0])
+        .flat_map(|row| (0..shape[1]).map(move |column| if column > row { upper } else { lower }))
         .collect();
 
     Tensor::from_slice(&mask, shape, device)
@@ -571,7 +551,10 @@ mod tests {
     use numr::runtime::cpu::CpuDevice;
 
     fn setup() -> (CpuDevice, Graph) {
-        (CpuDevice::new(), Graph::new())
+        (
+            CpuDevice::new(),
+            Graph::<numr::runtime::cpu::CpuRuntime>::new(),
+        )
     }
 
     // =========================================================================
@@ -586,7 +569,7 @@ mod tests {
         let b = graph.variable(Tensor::from_slice(&[3.0_f32, 4.0], &[2], &device)?)?;
         let out = graph.sum(a, b)?;
 
-        graph.backward(out)?;
+        graph.backward_with_grad(out, Tensor::ones(&[2], DType::F32, &device)?)?;
 
         // Forward: [1, 2] + [3, 4] = [4, 6]
         assert_eq!(graph.nodes[out].data.to_vec::<f32>(), vec![4.0, 6.0]);
@@ -605,7 +588,7 @@ mod tests {
         let b = graph.variable(Tensor::from_slice(&[4.0_f32, 5.0], &[2], &device)?)?;
         let out = graph.mul(a, b)?;
 
-        graph.backward(out)?;
+        graph.backward_with_grad(out, Tensor::ones(&[2], DType::F32, &device)?)?;
 
         // Forward: [2 * 4, 3 * 5] = [8, 15]
         assert_eq!(graph.nodes[out].data.to_vec::<f32>(), vec![8.0, 15.0]);
@@ -634,7 +617,7 @@ mod tests {
         )?)?;
 
         let out = graph.matmul(a, b)?;
-        graph.backward(out)?;
+        graph.backward_with_grad(out, Tensor::ones(&[2, 2], DType::F32, &device)?)?;
 
         // Forward: A . B = [[0.5, 1.0], [1.5, 2.0]]
         assert_eq!(
@@ -667,7 +650,7 @@ mod tests {
         )?)?;
         let out = graph.causal_mask(a)?;
 
-        graph.backward(out)?;
+        graph.backward_with_grad(out, Tensor::ones(&[2, 2], DType::F32, &device)?)?;
 
         let out_vec = graph.nodes[out].data.to_vec::<f32>();
 
@@ -694,7 +677,7 @@ mod tests {
         let a = graph.variable(Tensor::from_slice(&[0.0_f32, 0.0], &[1, 2], &device)?)?;
         let out = graph.softmax(a)?;
 
-        graph.backward(out)?;
+        graph.backward_with_grad(out, Tensor::ones(&[1, 2], DType::F32, &device)?)?;
 
         // Forward: Softmax([0, 0]) = [0.5, 0.5]
         assert_eq!(graph.nodes[out].data.to_vec::<f32>(), vec![0.5, 0.5]);
@@ -719,7 +702,7 @@ mod tests {
         )?)?;
         let out = graph.relu(a)?;
 
-        graph.backward(out)?;
+        graph.backward_with_grad(out, Tensor::ones(&[1, 4], DType::F32, &device)?)?;
 
         // Forward: ReLU([-1, 0, 1, 2]) = [0, 0, 1, 2]
         assert_eq!(
@@ -748,7 +731,7 @@ mod tests {
         )?)?;
         let out = graph.transpose(a)?;
 
-        graph.backward(out)?;
+        graph.backward_with_grad(out, Tensor::ones(&[3, 2], DType::F32, &device)?)?;
 
         // Forward: Transpose([[1, 2, 3], [4, 5, 6]]) = [[1, 4], [2, 5], [3, 6]]
         assert_eq!(
@@ -770,7 +753,7 @@ mod tests {
         let b = graph.variable(Tensor::from_slice(&[3.0_f32, 4.0], &[2, 1], &device)?)?;
         let out = graph.concat(&[a, b], 1)?;
 
-        graph.backward(out)?;
+        graph.backward_with_grad(out, Tensor::ones(&[2, 2], DType::F32, &device)?)?;
 
         // Forward: [[1], [2]] and [[3], [4]] concatenated -> [[1, 3], [2, 4]]
         assert_eq!(
@@ -798,26 +781,10 @@ mod tests {
         let bias = graph.variable(Tensor::from_slice(&[0.0_f32, 0.0], &[1, 2], &device)?)?;
         let out = graph.sum(x, bias)?;
 
-        graph.backward(out)?;
+        graph.backward_with_grad(out, Tensor::ones(&[3, 2], DType::F32, &device)?)?;
 
         assert_eq!(graph.nodes[bias].grad.shape(), &[1, 2]);
         assert_eq!(graph.nodes[bias].grad.to_vec::<f32>(), vec![3.0, 3.0]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_reset_gradients() -> Result<()> {
-        let (device, mut graph) = setup();
-
-        let a = graph.variable(Tensor::from_slice(&[1.0_f32, -2.0], &[1, 2], &device)?)?;
-        let out = graph.relu(a)?;
-
-        graph.backward(out)?;
-        assert_eq!(graph.nodes[a].grad.to_vec::<f32>(), vec![1.0, 0.0]);
-
-        graph.reset_gradients()?;
-        assert_eq!(graph.nodes[a].grad.to_vec::<f32>(), vec![0.0, 0.0]);
 
         Ok(())
     }
@@ -849,7 +816,7 @@ mod tests {
 
         let b = graph.variable(Tensor::from_slice(&[3.0_f32, 4.0], &[2], &device)?)?;
         let out = graph.mul(a, b)?;
-        graph.backward(out)?;
+        graph.backward_with_grad(out, Tensor::ones(&[2], DType::F32, &device)?)?;
 
         assert!(graph.nodes.len() > parameter_count);
         graph.truncate(parameter_count)?;
@@ -873,7 +840,7 @@ mod tests {
         let scale = graph.variable(Tensor::from_slice(&[2.0_f32], &[1], &device)?)?;
         let out = graph.mul(a, scale)?;
 
-        graph.backward(out)?;
+        graph.backward_with_grad(out, Tensor::ones(&[2, 2], DType::F32, &device)?)?;
 
         assert_eq!(graph.nodes[scale].grad.shape(), &[1]);
         assert_eq!(graph.nodes[scale].grad.to_vec::<f32>(), vec![10.0]);
@@ -926,7 +893,7 @@ mod tests {
         let output = graph.matmul(attn_weights, v)?;
 
         // --- BACKWARD PASS ---
-        graph.backward(output)?;
+        graph.backward_with_grad(output, Tensor::ones(&[2, 2], DType::F32, &device)?)?;
 
         // --- VERIFICATIONS ---
         let attn_probs = graph.nodes[attn_weights].data.to_vec::<f32>();

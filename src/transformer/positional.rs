@@ -13,11 +13,8 @@
 //! trainable.
 
 use crate::autograd::{self, Graph};
-use numr::{
-    error::Result,
-    runtime::cpu::{CpuDevice, CpuRuntime},
-    tensor::Tensor,
-};
+use numr::prelude::*;
+use numr::runtime::cpu::CpuRuntime;
 
 /// Sinusoidal positional encoding for sequence-major inputs.
 ///
@@ -26,20 +23,20 @@ use numr::{
 ///
 /// The table is fixed rather than learned, so it has no trainable parameters.
 /// Dropout after the addition is omitted to keep the toy model simple.
-pub struct PositionalEncoding {
-    table: Tensor<CpuRuntime>,
-    /// Maximum number of positions the table can represent.
-    pub max_len: usize,
-    /// Width of each positional vector.
-    pub d_model: usize,
+pub struct PositionalEncoding<R: Runtime = CpuRuntime> {
+    table: Tensor<R>,
 }
 
-impl PositionalEncoding {
+impl<R> PositionalEncoding<R>
+where
+    R: Runtime<DType = DType>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+{
     /// Builds a sinusoidal encoding table for positions `0..max_len`.
     ///
     /// # Arguments
     ///
-    /// * `device` - CPU device for tensor allocation
+    /// * `device` - Device for tensor allocation
     /// * `max_len` - Maximum supported sequence length
     /// * `d_model` - Model dimension; must match the token embeddings
     ///
@@ -47,7 +44,7 @@ impl PositionalEncoding {
     ///
     /// Returns an error if `max_len` or `d_model` is zero, or if tensor
     /// allocation fails.
-    pub fn new(device: &CpuDevice, max_len: usize, d_model: usize) -> Result<Self> {
+    pub fn new(device: &R::Device, max_len: usize, d_model: usize) -> Result<Self> {
         let mut values = vec![0.0_f32; max_len * d_model];
 
         for position in 0..max_len {
@@ -64,11 +61,7 @@ impl PositionalEncoding {
 
         let table = Tensor::from_slice(&values, &[max_len, d_model], device)?;
 
-        Ok(Self {
-            table,
-            max_len,
-            d_model,
-        })
+        Ok(Self { table })
     }
 
     /// Adds positional information to an input tensor.
@@ -86,7 +79,7 @@ impl PositionalEncoding {
     ///
     /// Returns an error if `x` is not 2-D, if its feature dimension does not
     /// match `d_model`, if it is empty, or if it is longer than `max_len`.
-    pub fn forward(&self, graph: &mut Graph, x: autograd::NodeId) -> Result<autograd::NodeId> {
+    pub fn forward(&self, graph: &mut Graph<R>, x: autograd::NodeId) -> Result<autograd::NodeId> {
         let shape = graph.nodes[x].data.shape();
         let seq_len = shape[0];
 
@@ -107,7 +100,7 @@ mod tests {
     #[test]
     fn test_positional_encoding_values() -> Result<()> {
         let device = CpuDevice::new();
-        let encoding = PositionalEncoding::new(&device, 2, 4)?;
+        let encoding = PositionalEncoding::<CpuRuntime>::new(&device, 2, 4)?;
         let table = encoding.table.to_vec::<f32>();
 
         // Position 0: sin(0) = 0, cos(0) = 1 for every frequency pair.
@@ -131,8 +124,8 @@ mod tests {
     #[test]
     fn test_positional_encoding_forward_adds_rows() -> Result<()> {
         let device = CpuDevice::new();
-        let encoding = PositionalEncoding::new(&device, 3, 4)?;
-        let mut graph = Graph::new();
+        let encoding = PositionalEncoding::<CpuRuntime>::new(&device, 3, 4)?;
+        let mut graph = Graph::<numr::runtime::cpu::CpuRuntime>::new();
         let x = graph.variable(Tensor::zeros(&[2, 4], DType::F32, &device)?)?;
 
         let out = encoding.forward(&mut graph, x)?;
@@ -147,7 +140,7 @@ mod tests {
         }
 
         // With a unit seed, the identity path receives a gradient of ones.
-        graph.backward(out)?;
+        graph.backward_with_grad(out, Tensor::ones(&[2, 4], DType::F32, &device)?)?;
         assert_eq!(graph.nodes[x].grad.to_vec::<f32>(), vec![1.0; 8]);
 
         Ok(())
@@ -156,11 +149,11 @@ mod tests {
     #[test]
     fn test_embedding_and_positional_encoding_feed_encoder() -> Result<()> {
         let device = CpuDevice::new();
-        let mut graph = Graph::new();
+        let mut graph = Graph::<numr::runtime::cpu::CpuRuntime>::new();
         let d_model = 8;
         let seq_len = 4;
         let embedding = TokenEmbedding::new(&mut graph, &device, 10, d_model)?;
-        let positional = PositionalEncoding::new(&device, seq_len, d_model)?;
+        let positional = PositionalEncoding::<CpuRuntime>::new(&device, seq_len, d_model)?;
         let encoder = Encoder::new(&mut graph, &device, d_model, 16, 2)?;
 
         let token_ids: Vec<usize> = (0..seq_len).collect();
@@ -169,7 +162,10 @@ mod tests {
         let encoded = encoder.forward(&mut graph, &device, positioned)?;
         let loss = graph.mul(encoded, encoded)?;
 
-        graph.backward(loss)?;
+        graph.backward_with_grad(
+            loss,
+            Tensor::ones(&[seq_len, d_model], DType::F32, &device)?,
+        )?;
 
         assert_eq!(graph.nodes[encoded].data.shape(), &[seq_len, d_model]);
         assert!(

@@ -7,7 +7,7 @@
 
 use super::normal_init;
 use crate::autograd::{self, Graph};
-use numr::{error::Result, runtime::cpu::CpuDevice, tensor::Tensor};
+use numr::prelude::*;
 
 /// Learned embedding table mapping integer token IDs to dense vectors.
 ///
@@ -26,8 +26,6 @@ pub struct TokenEmbedding {
     pub table: autograd::NodeId,
     /// Number of rows in the embedding table.
     pub vocab_size: usize,
-    /// Width of each embedding vector.
-    pub d_model: usize,
 }
 
 impl TokenEmbedding {
@@ -39,7 +37,7 @@ impl TokenEmbedding {
     /// # Arguments
     ///
     /// * `graph` - Autograd graph to register the table in
-    /// * `device` - CPU device for tensor allocation
+    /// * `device` - Device for tensor allocation
     /// * `vocab_size` - Number of tokens in the vocabulary
     /// * `d_model` - Embedding dimension
     ///
@@ -47,12 +45,16 @@ impl TokenEmbedding {
     ///
     /// Returns an error if `vocab_size` or `d_model` is zero, if `vocab_size`
     /// exceeds `i32::MAX`, or if tensor allocation fails.
-    pub fn new(
-        graph: &mut Graph,
-        device: &CpuDevice,
+    pub fn new<R>(
+        graph: &mut Graph<R>,
+        device: &R::Device,
         vocab_size: usize,
         d_model: usize,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    {
         let std = 1.0 / (d_model as f32).sqrt();
         let table = graph.variable(Tensor::from_slice(
             &normal_init(vocab_size * d_model, std),
@@ -60,11 +62,7 @@ impl TokenEmbedding {
             device,
         )?)?;
 
-        Ok(Self {
-            table,
-            vocab_size,
-            d_model,
-        })
+        Ok(Self { table, vocab_size })
     }
 
     /// Looks up token IDs and returns their embeddings.
@@ -72,7 +70,7 @@ impl TokenEmbedding {
     /// # Arguments
     ///
     /// * `graph` - Autograd graph to build the lookup in
-    /// * `device` - CPU device for the temporary one-hot tensor
+    /// * `device` - Device for the temporary one-hot tensor
     /// * `token_ids` - Token indices, each in `0..vocab_size`
     ///
     /// # Returns
@@ -83,23 +81,22 @@ impl TokenEmbedding {
     ///
     /// Returns an error if `token_ids` is empty, if any ID is out of range, or
     /// if a tensor operation fails.
-    pub fn forward(
+    pub fn forward<R>(
         &self,
-        graph: &mut Graph,
-        device: &CpuDevice,
+        graph: &mut Graph<R>,
+        device: &R::Device,
         token_ids: &[usize],
-    ) -> Result<autograd::NodeId> {
+    ) -> Result<autograd::NodeId>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    {
         let indices: Vec<i32> = token_ids.iter().map(|&id| id as i32).collect();
         let indices = Tensor::from_slice(&indices, &[token_ids.len()], device)?;
         let one_hot = indices.one_hot(self.vocab_size)?;
         let one_hot = graph.variable(one_hot)?;
 
         graph.matmul(one_hot, self.table)
-    }
-
-    /// Returns the node ID of the trainable embedding table.
-    pub fn parameters(&self) -> Vec<autograd::NodeId> {
-        vec![self.table]
     }
 }
 
@@ -112,7 +109,7 @@ mod tests {
     #[test]
     fn test_embedding_output_shape() -> Result<()> {
         let device = CpuDevice::new();
-        let mut graph = Graph::new();
+        let mut graph = Graph::<numr::runtime::cpu::CpuRuntime>::new();
         let embedding = TokenEmbedding::new(&mut graph, &device, 5, 4)?;
 
         let out = embedding.forward(&mut graph, &device, &[0, 2, 4])?;
@@ -125,7 +122,7 @@ mod tests {
     #[test]
     fn test_embedding_matches_table_rows() -> Result<()> {
         let device = CpuDevice::new();
-        let mut graph = Graph::new();
+        let mut graph = Graph::<numr::runtime::cpu::CpuRuntime>::new();
         let d_model = 4;
         let embedding = TokenEmbedding::new(&mut graph, &device, 5, d_model)?;
 
@@ -152,12 +149,12 @@ mod tests {
     #[test]
     fn test_embedding_accumulates_gradient_for_repeated_tokens() -> Result<()> {
         let device = CpuDevice::new();
-        let mut graph = Graph::new();
+        let mut graph = Graph::<numr::runtime::cpu::CpuRuntime>::new();
         let embedding = TokenEmbedding::new(&mut graph, &device, 3, 2)?;
 
         // Token 1 appears twice, so its row receives two units of gradient.
         let out = embedding.forward(&mut graph, &device, &[1, 1])?;
-        graph.backward(out)?;
+        graph.backward_with_grad(out, Tensor::ones(&[2, 2], DType::F32, &device)?)?;
 
         let grad = graph.nodes[embedding.table].grad.to_vec::<f32>();
         assert_eq!(grad, vec![0.0, 0.0, 2.0, 2.0, 0.0, 0.0]);
@@ -168,7 +165,7 @@ mod tests {
     #[test]
     fn test_embedding_feeds_encoder_and_receives_gradient() -> Result<()> {
         let device = CpuDevice::new();
-        let mut graph = Graph::new();
+        let mut graph = Graph::<numr::runtime::cpu::CpuRuntime>::new();
         let d_model = 8;
         let embedding = TokenEmbedding::new(&mut graph, &device, 10, d_model)?;
         let encoder = Encoder::new(&mut graph, &device, d_model, 16, 2)?;
@@ -178,7 +175,7 @@ mod tests {
         let encoded = encoder.forward(&mut graph, &device, embedded)?;
         let loss = graph.mul(encoded, encoded)?;
 
-        graph.backward(loss)?;
+        graph.backward_with_grad(loss, Tensor::ones(&[4, d_model], DType::F32, &device)?)?;
 
         assert_eq!(graph.nodes[encoded].data.shape(), &[4, d_model]);
         assert!(

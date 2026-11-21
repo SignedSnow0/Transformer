@@ -1,142 +1,43 @@
+//! Command-line entry point for the BERT examples.
+//!
+//! Usage:
+//!
+//! ```text
+//! cargo run --release -- [--cpu] [--spam] [DATA_TSV] [STEPS]
+//! ```
+//!
+//! By default this runs the masked-language-model example on
+//! `data/eng-it-sample.tsv` for 2,000 steps. With `--spam` it runs the SMS
+//! ham/spam classifier on `data/sms-spam-sample.tsv` for 250 steps. The
+//! implementation of each example lives in `src/bert/examples/`.
+//!
+//! The tensor math runs on WebGPU when an adapter is available and falls back
+//! to the CPU backend otherwise. Pass `--cpu` to force the CPU.
+
 mod autograd;
-mod optim;
+mod bert;
 mod training;
 mod transformer;
 
-use numr::runtime::cpu::CpuDevice;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+use bert::examples::{run_mlm, run_spam};
+use numr::runtime::cpu::{CpuDevice, CpuRuntime};
+use numr::runtime::wgpu::{WgpuDevice, WgpuRuntime, is_wgpu_available};
+use std::env;
+use std::error::Error;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let device = CpuDevice::new();
-    let seq_len = 4;
-    let d_model = 32;
-    let d_ff = 64;
-    let n_heads = 4;
+fn main() -> Result<(), Box<dyn Error>> {
+    let spam_mode = env::args().any(|argument| argument == "--spam");
+    let force_cpu = env::args().any(|argument| argument == "--cpu");
+    let use_wgpu = !force_cpu && is_wgpu_available();
 
-    let mut graph = autograd::Graph::new();
-    let model = transformer::Transformer::new(
-        &mut graph,
-        &device,
-        transformer::TransformerConfig {
-            vocab_size: training::VOCAB_SIZE,
-            d_model,
-            d_ff,
-            n_heads,
-            max_len: seq_len + 2,
-            sos_token: training::SOS_TOKEN,
-            eos_token: training::EOS_TOKEN,
-        },
-    )?;
-
-    let config = training::TrainConfig {
-        steps: 3_000,
-        seq_len,
-        eval_interval: 250,
-        eval_examples: 8,
-        optimizer: optim::AdamWConfig {
-            learning_rate: 3e-3,
-            weight_decay: 0.01,
-            ..optim::AdamWConfig::default()
-        },
-    };
-
-    println!(
-        "\nTraining with AdamW: {} steps, lr={}, weight decay={}",
-        config.steps, config.optimizer.learning_rate, config.optimizer.weight_decay
-    );
-
-    let mut rng = StdRng::seed_from_u64(7);
-    let history = training::train_reversal(&mut graph, &device, &model, &config, &mut rng)?;
-
-    println!("\nTraining loss (mean over each reporting window):");
-    for step in 1..=history.losses.len() {
-        if step.is_multiple_of(config.eval_interval) || step == history.losses.len() {
-            let start = step.saturating_sub(config.eval_interval);
-            let window = &history.losses[start..step];
-            let mean = window.iter().sum::<f32>() / window.len() as f32;
-            println!("  step {step:>4}: {mean:.4}");
-        }
+    if !force_cpu && !use_wgpu {
+        eprintln!("No WebGPU adapter found; falling back to the CPU backend.");
     }
 
-    println!("\nEvaluation on held-out examples:");
-    for evaluation in &history.evaluations {
-        println!(
-            "  step {:>4}: loss {:.4}, exact match {:>5.1}%",
-            evaluation.step,
-            evaluation.loss,
-            evaluation.exact_match * 100.0
-        );
+    match (spam_mode, use_wgpu) {
+        (true, true) => run_spam::<WgpuRuntime>(&WgpuDevice::new(0)),
+        (true, false) => run_spam::<CpuRuntime>(&CpuDevice::new()),
+        (false, true) => run_mlm::<WgpuRuntime>(&WgpuDevice::new(0)),
+        (false, false) => run_mlm::<CpuRuntime>(&CpuDevice::new()),
     }
-
-    println!(
-        "\nSample greedy predictions (digit token = id - {}):",
-        training::FIRST_DIGIT_TOKEN
-    );
-    let decoding = transformer::DecodingConfig {
-        max_new_tokens: seq_len + 1,
-        strategy: transformer::SamplingStrategy::Greedy,
-    };
-    let mut correct = 0;
-    let sample_count = 5;
-    for _ in 0..sample_count {
-        let example = training::sample_reversal(&mut rng, seq_len)?;
-        let generated = model.generate(&mut graph, &device, &example.input, &decoding, &mut rng)?;
-        let target = example.target_sequence();
-        let ok = generated == target;
-        correct += usize::from(ok);
-        println!(
-            "  {:>15} -> {:>15}  target {:>15}  {}",
-            format_tokens(&example.input),
-            format_tokens(&generated),
-            format_tokens(&target),
-            if ok { "OK" } else { "WRONG" }
-        );
-    }
-
-    let top_p_example = training::sample_reversal(&mut rng, seq_len)?;
-    let top_p = model.generate(
-        &mut graph,
-        &device,
-        &top_p_example.input,
-        &transformer::DecodingConfig {
-            max_new_tokens: seq_len + 1,
-            strategy: transformer::SamplingStrategy::TopP {
-                p: 0.9,
-                temperature: 0.8,
-            },
-        },
-        &mut rng,
-    )?;
-    println!(
-        "\nTop-p sample (p=0.9, temperature=0.8): {:>15} -> {:>15}  target {:>15}",
-        format_tokens(&top_p_example.input),
-        format_tokens(&top_p),
-        format_tokens(&top_p_example.target_sequence())
-    );
-
-    if let (Some(loss), Some(evaluation)) = (history.final_loss(), history.final_evaluation()) {
-        println!(
-            "\nFinal: training loss {loss:.4}, evaluation loss {:.4}, exact match {:.1}%",
-            evaluation.loss,
-            evaluation.exact_match * 100.0
-        );
-    }
-    println!("Sample predictions correct: {correct}/{sample_count}");
-
-    Ok(())
-}
-
-fn format_tokens(tokens: &[usize]) -> String {
-    tokens
-        .iter()
-        .map(|&token| {
-            if token >= training::FIRST_DIGIT_TOKEN {
-                (token - training::FIRST_DIGIT_TOKEN).to_string()
-            } else {
-                format!("<{token}>")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }

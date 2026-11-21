@@ -2,6 +2,8 @@
 //!
 //! This module implements encoder and decoder components for transformer architectures,
 //! operating on sequence-major tensors with shape `[sequence_length, model_dimension]`.
+//! The encoder layers are shared with the BERT demos; the decoder, vocabulary
+//! projection, and teacher-forced wrapper are retained for unit tests.
 //! The implementation features:
 //!
 //! - Learned token embeddings
@@ -9,23 +11,20 @@
 //! - Multi-head attention with a configurable number of heads
 //! - Encoder block with bidirectional self-attention and feed-forward networks
 //! - Decoder block with causal self-attention, cross-attention, and feed-forward networks
-//! - Vocabulary projection and greedy/top-p decoding
+//! - Vocabulary projection for teacher-forced logits
 //! - Pre-LayerNorm residual blocks
-mod decoding;
 mod embedding;
+#[cfg(test)]
 mod model;
+#[cfg(test)]
 mod output;
+#[cfg(test)]
 mod positional;
 
-pub use decoding::{DecodingConfig, SamplingStrategy};
 pub use embedding::TokenEmbedding;
-pub use model::{Transformer, TransformerConfig};
-pub use output::OutputProjection;
-pub use positional::PositionalEncoding;
 
-use crate::autograd::{self};
-use numr::dtype::DType;
-use numr::{error::Result, runtime::cpu::CpuDevice, tensor::Tensor};
+use crate::autograd;
+use numr::prelude::*;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::sync::Mutex;
@@ -54,7 +53,6 @@ static INIT_RNG: Mutex<Option<StdRng>> = Mutex::new(None);
 /// - Output projection: `w_o`, `b_o`
 pub struct MultiHeadAttention {
     pub n_heads: usize,
-    pub d_model: usize,
     pub d_head: usize,
     pub w_q: Vec<autograd::NodeId>,
     pub b_q: Vec<autograd::NodeId>,
@@ -72,7 +70,7 @@ impl MultiHeadAttention {
     /// # Arguments
     ///
     /// * `graph` - Autograd graph to register parameters in
-    /// * `device` - CPU device for tensor allocation
+    /// * `device` - Device for tensor allocation
     /// * `d_model` - Model dimension (embedding size)
     /// * `n_heads` - Number of attention heads; must divide `d_model`
     ///
@@ -80,12 +78,16 @@ impl MultiHeadAttention {
     ///
     /// Returns an error if `n_heads` is zero, does not divide `d_model`, or
     /// tensor allocation fails.
-    pub fn new(
-        graph: &mut autograd::Graph,
-        device: &CpuDevice,
+    pub fn new<R>(
+        graph: &mut autograd::Graph<R>,
+        device: &R::Device,
         d_model: usize,
         n_heads: usize,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    {
         let d_head = d_model / n_heads;
         let mut w_q = Vec::with_capacity(n_heads);
         let mut b_q = Vec::with_capacity(n_heads);
@@ -126,7 +128,6 @@ impl MultiHeadAttention {
 
         Ok(Self {
             n_heads,
-            d_model,
             d_head,
             w_q,
             b_q,
@@ -144,7 +145,7 @@ impl MultiHeadAttention {
     /// # Arguments
     ///
     /// * `graph` - Autograd graph to build computation in
-    /// * `device` - CPU device (used for temporary tensors)
+    /// * `device` - Device (used for temporary tensors)
     /// * `query` - Query input with shape `[seq_len, d_model]`
     /// * `key_value` - Optional key/value input with shape `[kv_len, d_model]`.
     ///   `None` uses `query` for self-attention.
@@ -158,14 +159,18 @@ impl MultiHeadAttention {
     ///
     /// Returns an error if causal masking is requested with different query
     /// and key/value sequence lengths, or if a tensor operation fails.
-    pub fn forward(
+    pub fn forward<R>(
         &self,
-        graph: &mut autograd::Graph,
-        device: &CpuDevice,
+        graph: &mut autograd::Graph<R>,
+        device: &R::Device,
         query: autograd::NodeId,
         key_value: Option<autograd::NodeId>,
         causal: bool,
-    ) -> Result<autograd::NodeId> {
+    ) -> Result<autograd::NodeId>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    {
         let key_value = key_value.unwrap_or(query);
 
         let scale = 1.0 / (self.d_head as f32).sqrt();
@@ -252,7 +257,7 @@ impl Encoder {
     /// # Arguments
     ///
     /// * `graph` - Autograd graph to register parameters in
-    /// * `device` - CPU device for tensor allocation
+    /// * `device` - Device for tensor allocation
     /// * `d_model` - Model dimension (embedding size)
     /// * `d_ff` - Feed-forward hidden dimension
     /// * `n_heads` - Number of attention heads; must divide `d_model`
@@ -261,13 +266,17 @@ impl Encoder {
     ///
     /// Returns an error if the attention configuration is invalid or tensor
     /// allocation fails.
-    pub fn new(
-        graph: &mut autograd::Graph,
-        device: &CpuDevice,
+    pub fn new<R>(
+        graph: &mut autograd::Graph<R>,
+        device: &R::Device,
         d_model: usize,
         d_ff: usize,
         n_heads: usize,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    {
         let attn = MultiHeadAttention::new(graph, device, d_model, n_heads)?;
 
         let gamma_1 = graph.variable(Tensor::ones(&[1, d_model], DType::F32, device)?)?;
@@ -308,7 +317,7 @@ impl Encoder {
     /// # Arguments
     ///
     /// * `graph` - Autograd graph to build computation in
-    /// * `device` - CPU device (used for temporary tensors)
+    /// * `device` - Device (used for temporary tensors)
     /// * `x` - Input node ID with shape `[seq_len, d_model]`
     ///
     /// # Returns
@@ -321,12 +330,16 @@ impl Encoder {
     /// 2. Residual connection
     /// 3. Pre-LayerNorm, then position-wise FFN: Linear -> ReLU -> Linear
     /// 4. Residual connection
-    pub fn forward(
+    pub fn forward<R>(
         &self,
-        graph: &mut autograd::Graph,
-        device: &CpuDevice,
+        graph: &mut autograd::Graph<R>,
+        device: &R::Device,
         x: autograd::NodeId,
-    ) -> Result<autograd::NodeId> {
+    ) -> Result<autograd::NodeId>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    {
         let attn_input = graph.layer_norm(x, self.gamma_1, self.beta_1, LAYER_NORM_EPS)?;
         let attn_out = self.attn.forward(graph, device, attn_input, None, false)?;
         let x_1 = graph.sum(x, attn_out)?;
@@ -375,6 +388,7 @@ impl Encoder {
 /// - Layer norms: `gamma_1`, `beta_1` (pre-self-attention),
 ///   `gamma_2`, `beta_2` (pre-cross-attention), `gamma_3`, `beta_3` (pre-FFN)
 /// - FFN: `w_1`, `b_1`, `w_2`, `b_2`
+#[cfg(test)]
 pub struct Decoder {
     pub self_attn: MultiHeadAttention,
     pub cross_attn: MultiHeadAttention,
@@ -392,13 +406,14 @@ pub struct Decoder {
     pub beta_3: autograd::NodeId,
 }
 
+#[cfg(test)]
 impl Decoder {
     /// Creates a new decoder layer with initialized parameters.
     ///
     /// # Arguments
     ///
     /// * `graph` - Autograd graph to register parameters in
-    /// * `device` - CPU device for tensor allocation
+    /// * `device` - Device for tensor allocation
     /// * `d_model` - Model dimension (embedding size)
     /// * `d_ff` - Feed-forward hidden dimension
     /// * `n_heads` - Number of attention heads; must divide `d_model`
@@ -407,13 +422,17 @@ impl Decoder {
     ///
     /// Returns an error if the attention configuration is invalid or tensor
     /// allocation fails.
-    pub fn new(
-        graph: &mut autograd::Graph,
-        device: &CpuDevice,
+    pub fn new<R>(
+        graph: &mut autograd::Graph<R>,
+        device: &R::Device,
         d_model: usize,
         d_ff: usize,
         n_heads: usize,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    {
         let self_attn = MultiHeadAttention::new(graph, device, d_model, n_heads)?;
         let cross_attn = MultiHeadAttention::new(graph, device, d_model, n_heads)?;
 
@@ -460,7 +479,7 @@ impl Decoder {
     /// # Arguments
     ///
     /// * `graph` - Autograd graph to build computation in
-    /// * `device` - CPU device (used for temporary tensors)
+    /// * `device` - Device (used for temporary tensors)
     /// * `x` - Decoder input node ID with shape `[seq_len, d_model]`
     /// * `enc_output` - Encoder output node ID with shape `[enc_len, d_model]`
     ///
@@ -476,13 +495,17 @@ impl Decoder {
     /// 4. Residual connection
     /// 5. Pre-LayerNorm, then position-wise FFN: Linear -> ReLU -> Linear
     /// 6. Residual connection
-    pub fn forward(
+    pub fn forward<R>(
         &self,
-        graph: &mut autograd::Graph,
-        device: &CpuDevice,
+        graph: &mut autograd::Graph<R>,
+        device: &R::Device,
         x: autograd::NodeId,
         enc_output: autograd::NodeId,
-    ) -> Result<autograd::NodeId> {
+    ) -> Result<autograd::NodeId>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    {
         let self_attn_input = graph.layer_norm(x, self.gamma_1, self.beta_1, LAYER_NORM_EPS)?;
         let self_attn_out = self
             .self_attn
@@ -502,34 +525,19 @@ impl Decoder {
 
         graph.sum(x_2, ffn_out)
     }
-
-    /// Returns the node IDs of every trainable parameter in this layer.
-    pub fn parameters(&self) -> Vec<autograd::NodeId> {
-        let mut params = self.self_attn.parameters();
-        params.extend(self.cross_attn.parameters());
-        params.extend([
-            self.gamma_1,
-            self.beta_1,
-            self.gamma_2,
-            self.beta_2,
-            self.w_1,
-            self.b_1,
-            self.w_2,
-            self.b_2,
-            self.gamma_3,
-            self.beta_3,
-        ]);
-        params
-    }
 }
 
 /// Applies linear transformation: `output = input @ weight + bias`
-fn linear(
-    graph: &mut autograd::Graph,
+pub(crate) fn linear<R>(
+    graph: &mut autograd::Graph<R>,
     x: autograd::NodeId,
     w: autograd::NodeId,
     b: autograd::NodeId,
-) -> Result<autograd::NodeId> {
+) -> Result<autograd::NodeId>
+where
+    R: Runtime<DType = DType>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+{
     let wx = graph.matmul(x, w)?;
     graph.sum(wx, b)
 }
@@ -558,7 +566,7 @@ fn normal_init(size: usize, std: f32) -> Vec<f32> {
 ///
 /// Used for weight initialization in linear layers.
 /// Based on He et al. 2015: "Delving Deep into Rectifiers".
-fn kaiming_init(size: usize, fan_in: usize) -> Vec<f32> {
+pub(crate) fn kaiming_init(size: usize, fan_in: usize) -> Vec<f32> {
     normal_init(size, (2.0 / fan_in as f32).sqrt())
 }
 
@@ -569,7 +577,10 @@ mod tests {
     use numr::runtime::cpu::CpuDevice;
 
     fn setup() -> (CpuDevice, Graph) {
-        (CpuDevice::new(), Graph::new())
+        (
+            CpuDevice::new(),
+            Graph::<numr::runtime::cpu::CpuRuntime>::new(),
+        )
     }
 
     #[test]
@@ -693,7 +704,10 @@ mod tests {
         )?)?;
         let loss = graph.mul(out, target)?;
 
-        graph.backward(loss)?;
+        graph.backward_with_grad(
+            loss,
+            Tensor::ones(&[seq_len, d_model], DType::F32, &device)?,
+        )?;
 
         let params = [
             ("w_q_0", attn.w_q[0]),
@@ -782,7 +796,10 @@ mod tests {
         )?)?;
         let loss = graph.mul(out, target)?;
 
-        graph.backward(loss)?;
+        graph.backward_with_grad(
+            loss,
+            Tensor::ones(&[seq_len, d_model], DType::F32, &device)?,
+        )?;
 
         let params = [
             ("w_v_0", encoder.attn.w_v[0]),
@@ -829,7 +846,10 @@ mod tests {
 
         let loss = graph.mul(out, out)?;
 
-        graph.backward(loss)?;
+        graph.backward_with_grad(
+            loss,
+            Tensor::ones(&[seq_len, d_model], DType::F32, &device)?,
+        )?;
 
         let params = [
             ("w_v_self_0", decoder.self_attn.w_v[0]),
