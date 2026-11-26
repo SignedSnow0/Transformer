@@ -14,13 +14,9 @@ use numr::prelude::*;
 /// The table has shape `[vocab_size, d_model]` and is a trainable graph
 /// variable. A lookup of `n` token IDs returns a `[n, d_model]` tensor.
 ///
-/// Lookups are implemented as a one-hot matrix multiplication against the
-/// table. This keeps the operation inside the existing autograd primitives:
-/// the matrix-multiplication backward pass already computes the correct table
-/// gradient, including summing the gradients of repeated token IDs into the
-/// same row. For the small vocabularies used by the toy examples this is
-/// inexpensive; a dedicated lookup/scatter-add operation would be preferable
-/// for large vocabularies.
+/// Lookups use the backend's embedding-gather operation. The backward pass
+/// scatters gradients into the selected rows and sums repeated IDs, avoiding a
+/// dense `[n, vocab_size]` one-hot matrix on every forward pass.
 pub struct TokenEmbedding {
     /// Trainable table node with shape `[vocab_size, d_model]`.
     pub table: autograd::NodeId,
@@ -53,7 +49,7 @@ impl TokenEmbedding {
     ) -> Result<Self>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         let std = 1.0 / (d_model as f32).sqrt();
         let table = graph.variable(Tensor::from_slice(
@@ -70,7 +66,7 @@ impl TokenEmbedding {
     /// # Arguments
     ///
     /// * `graph` - Autograd graph to build the lookup in
-    /// * `device` - Device for the temporary one-hot tensor
+    /// * `device` - Device for the temporary index tensors
     /// * `token_ids` - Token indices, each in `0..vocab_size`
     ///
     /// # Returns
@@ -89,14 +85,37 @@ impl TokenEmbedding {
     ) -> Result<autograd::NodeId>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
-        let indices: Vec<i32> = token_ids.iter().map(|&id| id as i32).collect();
-        let indices = Tensor::from_slice(&indices, &[token_ids.len()], device)?;
-        let one_hot = indices.one_hot(self.vocab_size)?;
-        let one_hot = graph.variable(one_hot)?;
+        if token_ids.is_empty() {
+            return Err(Error::InvalidArgument {
+                arg: "token_ids",
+                reason: "must not be empty".to_string(),
+            });
+        }
+        if token_ids.iter().any(|&id| id >= self.vocab_size) {
+            return Err(Error::InvalidArgument {
+                arg: "token_ids",
+                reason: "contains an ID outside the vocabulary".to_string(),
+            });
+        }
 
-        graph.matmul(one_hot, self.table)
+        let d_model = graph.nodes[self.table].data.shape()[1];
+        let indices_1d: Vec<i64> = token_ids.iter().map(|&id| id as i64).collect();
+        let indices_2d: Vec<i64> = token_ids
+            .iter()
+            .flat_map(|&id| std::iter::repeat_n(id as i64, d_model))
+            .collect();
+
+        let indices_1d =
+            graph.variable(Tensor::from_slice(&indices_1d, &[token_ids.len()], device)?)?;
+        let indices_2d = graph.variable(Tensor::from_slice(
+            &indices_2d,
+            &[token_ids.len(), d_model],
+            device,
+        )?)?;
+
+        graph.embedding_lookup(self.table, indices_1d, indices_2d)
     }
 }
 

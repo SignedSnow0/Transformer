@@ -5,21 +5,29 @@
 //! objective is BERT's masked language model: a random subset of content tokens
 //! is replaced by `[MASK]`, a random token, or left unchanged, and the model is
 //! trained to recover the original tokens from bidirectional context. The demo
-//! uses the learned BPE [`EncodingStrategy`], so
-//! rare words are encoded as subword pieces rather than `[UNK]`.
+//! uses the learned BPE [`EncodingStrategy`], so rare words are encoded as
+//! subword pieces rather than `[UNK]`; all pieces of a selected word are masked
+//! together.
+//! Validation reports both top-1 and top-5 masked-token accuracy on a fixed,
+//! deterministically sampled subset of the held-out pairs so long runs stay
+//! practical.
 //! Tokenization and vocabulary lookup live in [`crate::bert::encoding`].
 //!
-//! The bundled `data/eng-it-sample.tsv` file is a deterministic sample from
-//! OPUS Tatoeba (CC BY 2.0 FR). See `data/README.md` for provenance.
+//! The default `data/eng-it-full.tsv` is generated from OPUS Tatoeba. See
+//! `data/README.md` for provenance and regeneration commands.
 
-use super::{MASK_PROBABILITY, MAX_LEN, split_every_nth};
+use super::{
+    Checkpoint, DEFAULT_MLM_DATA, DEFAULT_MLM_STEPS, EarlyStopping, ExampleArgs, MASK_PROBABILITY,
+    MLM_MAX_EVAL_EXAMPLES, MLM_VOCAB_CORPUS_PAIRS, MLM_VOCAB_SIZE, MLM_WARMUP_STEPS,
+    reservoir_sample, split_every_nth,
+};
 use crate::autograd::{Graph, NodeId};
+use crate::bert::Bert;
 use crate::bert::encoding::{
     BERT_CLS_TOKEN, BERT_MASK_TOKEN, BERT_NUM_SPECIAL_TOKENS, BERT_SEP_TOKEN, BERT_UNK_TOKEN,
     BertVocab, EncodingStrategy, ParallelPair, tokenize,
 };
-use crate::bert::{Bert, BertConfig};
-use crate::training::{AdamW, AdamWConfig};
+use crate::training::{AdamW, AdamWConfig, LRSchedule};
 use numr::dtype::DType;
 use numr::error::{Error, Result};
 use numr::ops::{CompareOps, ScalarOps, TensorOps};
@@ -28,12 +36,16 @@ use numr::runtime::Runtime;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use std::env;
 use std::error::Error as StdError;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Number of candidate tokens shown and counted for top-k accuracy.
+const TOP_K: usize = 5;
+/// Number of held-out examples displayed after training.
+const DISPLAY_EXAMPLES: usize = 5;
 
 /// Loads a two-column TSV file with English and Italian sentences.
 ///
@@ -112,8 +124,10 @@ pub struct BertExample {
 /// ```
 ///
 /// Text is encoded with the vocabulary's [`EncodingStrategy`], so the same code
-/// works with whole words or BPE pieces. At least one maskable content token is
-/// always selected. Returns `None` if the pair contains none after truncation.
+/// works with whole words or BPE pieces. With BPE, every piece of a selected
+/// word is masked together so the objective predicts whole words rather than
+/// isolated fragments. At least one maskable word is always selected. Returns
+/// `None` if the pair contains none after truncation.
 pub fn build_mlm_example(
     pair: &ParallelPair,
     vocab: &BertVocab,
@@ -126,10 +140,10 @@ pub fn build_mlm_example(
         return None;
     }
 
-    let pre_tokens = tokenize(&pair.english);
-    let english_tokens = vocab.encode_tokens(&pre_tokens);
-    let pre_tokens = tokenize(&pair.italian);
-    let italian_tokens = vocab.encode_tokens(&pre_tokens);
+    let pre_tokens_for_english = tokenize(&pair.english);
+    let english_tokens = vocab.encode_tokens(&pre_tokens_for_english);
+    let pre_tokens_for_italian = tokenize(&pair.italian);
+    let italian_tokens = vocab.encode_tokens(&pre_tokens_for_italian);
 
     let mut english_len = english_tokens.len().min(max_content / 2);
     let mut italian_len = italian_tokens.len().min(max_content - english_len);
@@ -146,15 +160,30 @@ pub fn build_mlm_example(
 
     let mut token_ids = Vec::with_capacity(english_len + italian_len + 3);
     let mut token_type_ids = Vec::with_capacity(english_len + italian_len + 3);
+    let mut word_groups: Vec<Vec<usize>> = Vec::new();
 
     token_ids.push(BERT_CLS_TOKEN);
     token_type_ids.push(0);
+    append_word_groups(
+        &mut word_groups,
+        &vocab.encode_token_groups(&pre_tokens_for_english),
+        english_len,
+        1,
+    );
     for &token in &english_tokens[..english_len] {
         token_ids.push(token);
         token_type_ids.push(0);
     }
     token_ids.push(BERT_SEP_TOKEN);
     token_type_ids.push(0);
+
+    let italian_offset = token_ids.len();
+    append_word_groups(
+        &mut word_groups,
+        &vocab.encode_token_groups(&pre_tokens_for_italian),
+        italian_len,
+        italian_offset,
+    );
     for &token in &italian_tokens[..italian_len] {
         token_ids.push(token);
         token_type_ids.push(1);
@@ -162,10 +191,15 @@ pub fn build_mlm_example(
     token_ids.push(BERT_SEP_TOKEN);
     token_type_ids.push(1);
 
-    let candidates: Vec<usize> = token_ids
-        .iter()
-        .enumerate()
-        .filter_map(|(position, &id)| vocab.is_maskable(id).then_some(position))
+    let candidates: Vec<Vec<usize>> = word_groups
+        .into_iter()
+        .filter_map(|group| {
+            let maskable: Vec<usize> = group
+                .into_iter()
+                .filter(|&position| vocab.is_maskable(token_ids[position]))
+                .collect();
+            (!maskable.is_empty()).then_some(maskable)
+        })
         .collect();
     if candidates.is_empty() {
         return None;
@@ -177,15 +211,15 @@ pub fn build_mlm_example(
         0.15
     };
     let mut masked = Vec::new();
-    for &position in &candidates {
+    for group in &candidates {
         if rng.random::<f32>() < probability {
-            masked.push(apply_mask(&mut token_ids, position, vocab.len(), rng));
+            apply_word_mask(&mut token_ids, group, vocab.len(), rng, &mut masked);
         }
     }
 
     if masked.is_empty() {
-        let position = candidates[rng.random_range(0..candidates.len())];
-        masked.push(apply_mask(&mut token_ids, position, vocab.len(), rng));
+        let group = &candidates[rng.random_range(0..candidates.len())];
+        apply_word_mask(&mut token_ids, group, vocab.len(), rng, &mut masked);
     }
 
     Some(BertExample {
@@ -195,29 +229,53 @@ pub fn build_mlm_example(
     })
 }
 
-fn apply_mask(
+/// Translates per-word piece positions into sequence positions after truncation.
+fn append_word_groups(
+    groups: &mut Vec<Vec<usize>>,
+    encoded_groups: &[Vec<usize>],
+    kept_tokens: usize,
+    offset: usize,
+) {
+    for group in encoded_groups {
+        let kept: Vec<usize> = group
+            .iter()
+            .filter_map(|&position| (position < kept_tokens).then_some(offset + position))
+            .collect();
+        if !kept.is_empty() {
+            groups.push(kept);
+        }
+    }
+}
+
+/// Applies the same 80/10/10 masking decision to every piece of one word.
+fn apply_word_mask(
     token_ids: &mut [usize],
-    position: usize,
+    positions: &[usize],
     vocab_size: usize,
     rng: &mut impl RngExt,
-) -> (usize, usize) {
-    let target = token_ids[position];
+    masked: &mut Vec<(usize, usize)>,
+) {
     let roll = rng.random::<f32>();
-
-    token_ids[position] = if roll < 0.8 {
-        BERT_MASK_TOKEN
+    let replacement = if roll < 0.8 {
+        Some(BERT_MASK_TOKEN)
     } else if roll < 0.9 {
         let content_size = vocab_size.saturating_sub(BERT_NUM_SPECIAL_TOKENS);
-        if content_size == 0 {
+        Some(if content_size == 0 {
             BERT_UNK_TOKEN
         } else {
             BERT_NUM_SPECIAL_TOKENS + rng.random_range(0..content_size)
-        }
+        })
     } else {
-        target
+        None
     };
 
-    (position, target)
+    for &position in positions {
+        let target = token_ids[position];
+        if let Some(replacement) = replacement {
+            token_ids[position] = replacement;
+        }
+        masked.push((position, target));
+    }
 }
 
 /// Training settings for BERT MLM.
@@ -227,47 +285,90 @@ pub struct BertTrainConfig {
     pub steps: usize,
     /// Print a progress line every this many steps. Zero disables progress.
     pub progress_interval: usize,
-    /// Probability of selecting a content token for masking.
+    /// Probability of selecting a content word for masking.
     pub mask_probability: f32,
-    /// AdamW hyperparameters.
+    /// AdamW hyperparameters; the learning rate acts as the schedule's peak.
     pub optimizer: AdamWConfig,
+    /// Learning-rate warmup and cosine decay.
+    pub schedule: LRSchedule,
+    /// Validate every this many steps. Zero validates only at the start/end.
+    pub validation_interval: usize,
+    /// Stop after this many validations without improvement. Zero disables it.
+    pub patience: usize,
+    /// Minimum loss decrease counted as an improvement.
+    pub min_delta: f32,
+    /// Restore the best validation parameters before returning.
+    pub restore_best: bool,
 }
 
 impl Default for BertTrainConfig {
     fn default() -> Self {
+        let validation_interval = DEFAULT_MLM_STEPS.div_ceil(20);
         Self {
-            steps: 500,
+            steps: DEFAULT_MLM_STEPS,
             progress_interval: 0,
-            mask_probability: 0.15,
+            mask_probability: MASK_PROBABILITY,
             optimizer: AdamWConfig {
                 learning_rate: 1e-3,
                 weight_decay: 0.01,
                 ..AdamWConfig::default()
             },
+            schedule: LRSchedule {
+                warmup_steps: MLM_WARMUP_STEPS.min(validation_interval),
+                min_lr_ratio: 0.05,
+            },
+            validation_interval,
+            patience: 8,
+            min_delta: 1e-4,
+            restore_best: true,
         }
     }
 }
 
-/// Final evaluation result for a fixed set of masked examples.
+impl BertTrainConfig {
+    fn validate(&self) -> Result<()> {
+        if !(0.0..=1.0).contains(&self.mask_probability) {
+            return invalid("mask_probability", "must be in [0, 1]");
+        }
+        if !self.min_delta.is_finite() || self.min_delta < 0.0 {
+            return invalid("min_delta", "must be finite and non-negative");
+        }
+        self.schedule.validate()
+    }
+}
+
+/// Evaluation result for a fixed set of masked examples.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BertEvaluation {
-    /// Optimizer step at which final evaluation ran.
+    /// Optimizer step at which evaluation ran.
     pub step: usize,
     /// Mean masked-token cross-entropy loss.
     pub loss: f32,
     /// Fraction of masked tokens predicted correctly.
     pub masked_accuracy: f32,
+    /// Fraction of masked tokens whose target appears in the top five logits.
+    pub top5_accuracy: f32,
     /// Number of masked tokens evaluated.
     pub masked_tokens: usize,
 }
 
-/// Losses and the final evaluation collected during BERT training.
+/// Losses, validation scores, and checkpoints collected during BERT training.
 #[derive(Debug, Clone, Default)]
 pub struct BertTrainingHistory {
     /// Training loss for every step.
     pub losses: Vec<f32>,
-    /// Held-out evaluation after the final optimizer step.
+    /// Learning rate used at every step.
+    pub learning_rates: Vec<f32>,
+    /// Evaluation at step zero and every validation point.
+    pub evaluations: Vec<BertEvaluation>,
+    /// Best evaluation by masked-token loss.
+    pub best_evaluation: Option<BertEvaluation>,
+    /// Held-out evaluation of the parameters left in the graph.
     pub final_evaluation: Option<BertEvaluation>,
+    /// Number of optimizer steps actually run.
+    pub steps_run: usize,
+    /// Whether early stopping ended training before `steps`.
+    pub stopped_early: bool,
 }
 
 impl BertTrainingHistory {
@@ -306,10 +407,14 @@ pub struct BertTrainingSet<'a> {
 ///
 /// The graph is assumed to contain the model parameters when training starts.
 /// Per-step forward intermediates are removed with
-/// [`Graph::truncate`](crate::autograd::Graph::truncate).
+/// [`Graph::truncate`](crate::autograd::Graph::truncate). Every step draws a
+/// fresh pair and a fresh mask, so a sentence can be reused with different
+/// masked tokens instead of being seen only once.
 ///
-/// Held-out evaluation runs once, after the final optimizer step. A caller that
-/// wants a baseline should call [`evaluate_bert`] explicitly before training.
+/// Evaluation runs at step zero, at every `validation_interval`, and at the
+/// final step. Improvements are checkpointed on the device; if early stopping
+/// fires or `restore_best` is enabled, the best parameters are put back into the
+/// graph before the final evaluation.
 ///
 /// # Errors
 ///
@@ -326,7 +431,7 @@ pub fn train_bert<R>(
 ) -> Result<BertTrainingHistory>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
     if data.train_pairs.is_empty() {
         return invalid("train_pairs", "must not be empty");
@@ -334,9 +439,7 @@ where
     if data.eval_examples.is_empty() {
         return invalid("eval_examples", "must not be empty");
     }
-    if !(0.0..=1.0).contains(&config.mask_probability) {
-        return invalid("mask_probability", "must be in [0, 1]");
-    }
+    config.validate()?;
 
     let parameters = model.parameters();
     let base_len = parameter_prefix_len(&parameters);
@@ -344,14 +447,33 @@ where
 
     let mut optimizer = AdamW::<R>::new(config.optimizer, &parameters)?;
     let mut history = BertTrainingHistory::default();
+    let mut stopping = EarlyStopping::new();
+    let mut best_checkpoint: Option<Checkpoint<R>> = None;
+
+    let initial = evaluate_bert(graph, device, model, data.eval_examples, 0)?;
+    history.evaluations.push(initial);
+    let (improved, _) = stopping.observe(0, initial.loss, config.min_delta, config.patience);
+    if improved {
+        history.best_evaluation = Some(initial);
+        best_checkpoint = Some(Checkpoint::capture(graph, &parameters, 0)?);
+    }
 
     // Keep each step's scalar loss on the device and read the whole vector
     // once after training. This keeps the optimization loop free of
     // device-to-host copies.
     let mut step_losses: Vec<Tensor<R>> = Vec::with_capacity(config.steps);
+    let peak_learning_rate = config.optimizer.learning_rate;
     let started = Instant::now();
+    let mut last_step = 0;
+    let mut stopped_early = false;
 
     for step in 1..=config.steps {
+        let learning_rate = config
+            .schedule
+            .learning_rate(peak_learning_rate, step, config.steps);
+        optimizer.set_learning_rate(learning_rate)?;
+        history.learning_rates.push(learning_rate);
+
         let example = sample_training_example(
             data.train_pairs,
             data.vocab,
@@ -366,13 +488,21 @@ where
 
         optimizer.zero_grad(graph)?;
 
-        let output = model.forward(graph, device, &example.token_ids, &example.token_type_ids)?;
+        let output = model.forward_with_dropout(
+            graph,
+            device,
+            &example.token_ids,
+            &example.token_type_ids,
+            true,
+            rng,
+        )?;
         let (loss, gradient) =
             masked_loss_and_gradient(graph, output.logits, &example, model.vocab_size(), device)?;
         graph.backward_with_grad(output.logits, gradient)?;
         optimizer.step(graph)?;
         graph.truncate(base_len)?;
         step_losses.push(loss);
+        last_step = step;
 
         if config.progress_interval > 0
             && (step.is_multiple_of(config.progress_interval) || step == config.steps)
@@ -386,6 +516,37 @@ where
                 width = width
             );
         }
+
+        let validate = step == config.steps
+            || (config.validation_interval > 0 && step.is_multiple_of(config.validation_interval));
+        if validate {
+            let evaluation = evaluate_bert(graph, device, model, data.eval_examples, step)?;
+            history.evaluations.push(evaluation);
+            let (improved, should_stop) =
+                stopping.observe(step, evaluation.loss, config.min_delta, config.patience);
+            if improved {
+                history.best_evaluation = Some(evaluation);
+                best_checkpoint = Some(Checkpoint::capture(graph, &parameters, step)?);
+            }
+            if should_stop {
+                stopped_early = step < config.steps;
+                break;
+            }
+        }
+    }
+
+    history.steps_run = last_step;
+    history.stopped_early = stopped_early;
+
+    let final_step = best_checkpoint
+        .as_ref()
+        .filter(|_| config.restore_best)
+        .map_or(last_step, Checkpoint::step);
+    if config.restore_best
+        && let Some(checkpoint) = best_checkpoint.as_ref()
+    {
+        checkpoint.restore(graph, &parameters)?;
+        graph.truncate(base_len)?;
     }
 
     history.final_evaluation = Some(evaluate_bert(
@@ -393,7 +554,7 @@ where
         device,
         model,
         data.eval_examples,
-        config.steps,
+        final_step,
     )?);
 
     if !step_losses.is_empty() {
@@ -404,6 +565,11 @@ where
     Ok(history)
 }
 
+/// Draws a fresh training pair and mask.
+///
+/// Sampling with replacement is deliberate: a sentence can be revisited with a
+/// different mask, which gives more training signal per sentence than a single
+/// pass over the corpus.
 fn sample_training_example(
     train_pairs: &[ParallelPair],
     vocab: &BertVocab,
@@ -421,6 +587,11 @@ fn sample_training_example(
         }
     }
     None
+}
+
+/// Selects the fixed validation subset used during training.
+fn sample_evaluation_examples(examples: &[BertExample], rng: &mut impl RngExt) -> Vec<BertExample> {
+    reservoir_sample(examples, MLM_MAX_EVAL_EXAMPLES, rng)
 }
 
 /// Evaluates masked-token loss and accuracy on fixed examples.
@@ -442,7 +613,7 @@ pub fn evaluate_bert<R>(
 ) -> Result<BertEvaluation>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
     if examples.is_empty() {
         return invalid("examples", "must not be empty");
@@ -452,6 +623,7 @@ where
     let vocab_size = model.vocab_size();
     let mut total_loss: Option<Tensor<R>> = None;
     let mut total_correct: Option<Tensor<R>> = None;
+    let mut total_top5: Option<Tensor<R>> = None;
     let mut masked_tokens = 0_usize;
 
     for example in examples {
@@ -478,6 +650,29 @@ where
             None => correct,
         });
 
+        // Rank by repeatedly taking the argmax and hiding that candidate. This
+        // stays on the device and avoids reading a `[tokens, vocab]` matrix to
+        // the host just to report top-k accuracy.
+        let mut ranking_logits = batch.selected;
+        let mut top5_hits: Option<Tensor<R>> = None;
+        for _ in 0..TOP_K {
+            let candidate = ranking_logits.argmax(1, false)?;
+            let candidate_one_hot = candidate.one_hot(vocab_size)?;
+            let hit = candidate_one_hot.mul(&batch.one_hot)?.sum(&[1], false)?;
+            top5_hits = Some(match top5_hits {
+                Some(total) => total.add(&hit)?,
+                None => hit,
+            });
+            ranking_logits = ranking_logits.sub(&candidate_one_hot.mul_scalar(1e9_f64)?)?;
+        }
+        let top5_correct = top5_hits
+            .expect("top-k loop always records a hit")
+            .sum(&[0], true)?;
+        total_top5 = Some(match total_top5 {
+            Some(total) => total.add(&top5_correct)?,
+            None => top5_correct,
+        });
+
         masked_tokens += batch.count;
         graph.truncate(base_len)?;
     }
@@ -486,11 +681,13 @@ where
     let total_correct = total_correct
         .expect("examples are non-empty")
         .to_vec::<f32>()[0];
+    let total_top5 = total_top5.expect("examples are non-empty").to_vec::<f32>()[0];
 
     Ok(BertEvaluation {
         step,
         loss: total_loss / masked_tokens as f32,
         masked_accuracy: total_correct / masked_tokens as f32,
+        top5_accuracy: total_top5 / masked_tokens as f32,
         masked_tokens,
     })
 }
@@ -513,15 +710,13 @@ pub fn predict_masked_tokens<R>(
 ) -> Result<Vec<BertPrediction>>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
     let base_len = parameter_prefix_len(&model.parameters());
     let vocab_size = model.vocab_size();
 
     let output = model.forward(graph, device, &example.token_ids, &example.token_type_ids)?;
     let batch = masked_batch(graph, output.logits, example, vocab_size, device)?;
-
-    const TOP_K: usize = 5;
 
     let probability_rows = batch.selected.softmax(-1)?.to_vec::<f32>();
     let predictions = example
@@ -573,7 +768,7 @@ fn masked_batch<R>(
 ) -> Result<MaskedBatch<R>>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
     let shape = graph.nodes[logits].data.shape();
     if shape.len() != 2 || shape[1] != vocab_size {
@@ -631,7 +826,7 @@ fn masked_cross_entropy<R>(
 ) -> Result<(Tensor<R>, Tensor<R>)>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
     if count == 0 {
         return invalid("count", "must be greater than zero");
@@ -658,7 +853,7 @@ fn masked_loss_and_gradient<R>(
 ) -> Result<(Tensor<R>, Tensor<R>)>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
     let batch = masked_batch(graph, logits, example, vocab_size, device)?;
     let (loss, selected_gradient) =
@@ -699,27 +894,25 @@ fn invalid<T>(argument: &'static str, reason: impl Into<String>) -> Result<T> {
 
 /// Runs the MLM demo on the selected backend.
 ///
-/// Positional command-line arguments are `[DATA_TSV] [STEPS]`; `--cpu` and
-/// `--spam` are ignored here because the binary has already filtered them.
+/// Positional arguments are `[DATA_TSV] [STEPS]`. Capacity flags are
+/// `--d-model`, `--d-ff`, `--n-heads`, `--layers`, `--max-len`, and `--dropout`;
+/// `--cpu` and `--spam` are handled by the binary.
 ///
 /// # Errors
 ///
-/// Returns an error if the corpus or step count is invalid, or if a tensor
-/// operation fails.
+/// Returns an error if an argument, corpus, or tensor operation is invalid.
 pub fn run_mlm<R>(device: &R::Device) -> std::result::Result<(), Box<dyn StdError>>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
-    let mut arguments = env::args().skip(1).filter(|argument| argument != "--cpu");
+    let arguments = ExampleArgs::parse()?;
     let data_path = arguments
-        .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("data/eng-it-sample.tsv"));
-    let steps = match arguments.next() {
-        Some(value) => value.parse::<usize>()?,
-        None => 2_000,
-    };
+        .data_path
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_MLM_DATA));
+    let steps = arguments.steps.unwrap_or(DEFAULT_MLM_STEPS);
+    let capacity = arguments.capacity;
+    let max_len = capacity.max_len;
 
     let pairs = load_parallel_pairs(&data_path)?;
     let (training_pairs, evaluation_pairs) = split_every_nth(&pairs, 10);
@@ -727,34 +920,33 @@ where
     // Train BPE merges only on the training split so evaluation text cannot
     // leak into the vocabulary. Rare evaluation words are composed from known
     // subword pieces instead of collapsing to `[UNK]`.
-    let vocab = BertVocab::build_with_strategy(&training_pairs, 3_000, 1, EncodingStrategy::Bpe);
+    // BPE training is quadratic in the number of merges, so learn merges from a
+    // deterministic subset of the training split instead of all 215k pairs.
+    let vocab_rng = &mut StdRng::seed_from_u64(21);
+    let vocab_pairs = reservoir_sample(&training_pairs, MLM_VOCAB_CORPUS_PAIRS, vocab_rng);
+    let vocab =
+        BertVocab::build_with_strategy(&vocab_pairs, MLM_VOCAB_SIZE, 1, EncodingStrategy::Bpe);
     let mut graph = Graph::<R>::new();
-    let model = Bert::new(
-        &mut graph,
-        device,
-        BertConfig {
-            vocab_size: vocab.len(),
-            d_model: 64,
-            d_ff: 128,
-            n_heads: 4,
-            n_layers: 2,
-            max_len: MAX_LEN,
-            tie_word_embeddings: true,
-        },
-    )?;
+    let model = Bert::new(&mut graph, device, capacity.bert_config(vocab.len()))?;
 
     let mut eval_rng = StdRng::seed_from_u64(101);
-    let evaluation_examples: Vec<BertExample> = evaluation_pairs
+    let all_evaluation_examples: Vec<BertExample> = evaluation_pairs
         .iter()
         .filter_map(|pair| {
-            build_mlm_example(pair, &vocab, MAX_LEN, MASK_PROBABILITY, &mut eval_rng)
+            build_mlm_example(pair, &vocab, max_len, MASK_PROBABILITY, &mut eval_rng)
         })
         .collect();
+
+    // Validation runs many times during training, so a fixed deterministic
+    // subset is much cheaper than re-scoring every held-out pair. The full
+    // held-out split is still visible to the sample display below.
+    let evaluation_examples = sample_evaluation_examples(&all_evaluation_examples, &mut eval_rng);
 
     let encoding_name = match vocab.strategy() {
         EncodingStrategy::Word => "word",
         EncodingStrategy::Bpe => "bpe",
     };
+    let validation_interval = steps.div_ceil(20).max(1);
 
     println!("BERT masked-language-model pretraining");
     println!("  backend:           {}", R::name());
@@ -767,23 +959,29 @@ where
         training_pairs.len(),
         evaluation_pairs.len()
     );
-    println!("  vocabulary:        {} tokens", vocab.len());
     println!(
-        "  evaluation masks:  {} tokens in {} examples",
+        "  vocabulary:        {} tokens (BPE from {} training pairs)",
+        vocab.len(),
+        vocab_pairs.len()
+    );
+    println!(
+        "  evaluation masks:  {} tokens in {} examples (sampled from {})",
         evaluation_examples
             .iter()
             .map(|example| example.masked.len())
             .sum::<usize>(),
-        evaluation_examples.len()
+        evaluation_examples.len(),
+        all_evaluation_examples.len()
     );
     println!(
-        "  model:             {} layers, d_model={}, d_ff={}, {} heads",
-        model.config.n_layers, model.config.d_model, model.config.d_ff, model.config.n_heads
+        "  model:             {} layers, d_model={}, d_ff={}, {} heads, max_len={}, dropout={:.2}",
+        model.config.n_layers,
+        model.config.d_model,
+        model.config.d_ff,
+        model.config.n_heads,
+        model.config.max_len,
+        model.config.dropout
     );
-    println!();
-    println!("Note: BERT is encoder-only. This trains masked-token prediction,");
-    println!("      not English-to-Italian translation. BPE pieces are learned");
-    println!("      from the training split only.");
     println!();
 
     let mut rng = StdRng::seed_from_u64(7);
@@ -798,13 +996,19 @@ where
         },
         &BertTrainConfig {
             steps,
-            progress_interval: steps.div_ceil(20).max(1),
+            progress_interval: validation_interval,
             mask_probability: MASK_PROBABILITY,
             optimizer: AdamWConfig {
                 learning_rate: 1e-3,
                 weight_decay: 0.01,
                 ..Default::default()
             },
+            schedule: LRSchedule {
+                warmup_steps: MLM_WARMUP_STEPS.min(validation_interval),
+                min_lr_ratio: 0.05,
+            },
+            validation_interval,
+            ..BertTrainConfig::default()
         },
         &mut rng,
     )?;
@@ -817,7 +1021,10 @@ where
         };
 
         println!();
-        println!("Final result (step {}):", evaluation.step);
+        println!(
+            "Final result (step {} of {}):",
+            evaluation.step, history.steps_run
+        );
         println!(
             "  training loss:   {:.4} (mean), {:.4} (last step)",
             mean_training_loss,
@@ -829,9 +1036,30 @@ where
             evaluation.masked_accuracy * 100.0,
             evaluation.masked_tokens
         );
+        println!(
+            "  top-5 accuracy:  {:.1}% ({} tokens)",
+            evaluation.top5_accuracy * 100.0,
+            evaluation.masked_tokens
+        );
+        if let Some(best) = history.best_evaluation {
+            println!("  best validation: {:.4} at step {}", best.loss, best.step);
+        }
+        if history.stopped_early {
+            println!("  early stopping ended training before the requested steps");
+        }
     }
 
-    print_examples(&mut graph, device, &model, &vocab, &evaluation_examples)?;
+    // Pick fresh held-out sentences for the sample display on every run. The
+    // validation metric above uses its own fixed subset, so this does not make
+    // the reported accuracy nondeterministic.
+    let sample_seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64)
+        ^ u64::from(std::process::id());
+    let mut display_rng = StdRng::seed_from_u64(sample_seed);
+    let display_examples =
+        reservoir_sample(&all_evaluation_examples, DISPLAY_EXAMPLES, &mut display_rng);
+    print_examples(&mut graph, device, &model, &vocab, &display_examples)?;
     Ok(())
 }
 
@@ -845,22 +1073,18 @@ fn print_examples<R>(
 ) -> std::result::Result<(), Box<dyn StdError>>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
     println!();
     println!("Sample masked-token predictions:");
-    println!("(other masks in each example are restored so the context is readable)");
-    for example in examples.iter().take(5) {
+    for example in examples.iter().take(DISPLAY_EXAMPLES) {
         let Some(prediction) = predict_masked_tokens(graph, device, model, example)?
             .into_iter()
             .next()
         else {
             continue;
         };
-        println!(
-            "  ... {} ...",
-            display_context(example, prediction.position, vocab)
-        );
+        println!("  ... {} ...", vocab.decode(&example.token_ids));
         let target_rank = prediction
             .alternatives
             .iter()
@@ -891,17 +1115,6 @@ where
         println!("      top 5: {candidates}");
     }
     Ok(())
-}
-
-/// Restores every mask except `position`, so the displayed context shows only
-/// the token the model is being asked to predict.
-fn display_context(example: &BertExample, position: usize, vocab: &BertVocab) -> String {
-    let mut token_ids = example.token_ids.clone();
-    for &(masked_position, target) in &example.masked {
-        token_ids[masked_position] = target;
-    }
-    token_ids[position] = BERT_MASK_TOKEN;
-    vocab.decode(&token_ids)
 }
 
 #[cfg(test)]
@@ -968,31 +1181,61 @@ mod tests {
     }
 
     #[test]
-    fn test_display_context_restores_other_masks() {
-        let corpus = pairs();
-        let vocab = BertVocab::build_with_strategy(&corpus, 32, 1, EncodingStrategy::Word);
-        let example = BertExample {
-            token_ids: vec![
-                BERT_CLS_TOKEN,
-                BERT_MASK_TOKEN,
-                BERT_MASK_TOKEN,
-                BERT_SEP_TOKEN,
-            ],
-            token_type_ids: vec![0, 0, 0, 0],
-            masked: vec![(1, vocab.id("gatto")), (2, vocab.id("tavolo"))],
-        };
+    fn test_bpe_masking_covers_whole_word() {
+        let corpus: Vec<ParallelPair> = (0..60)
+            .map(|_| ParallelPair::new("stazione", "gatto"))
+            .collect();
+        let vocab = BertVocab::build_with_strategy(&corpus, 24, 1, EncodingStrategy::Bpe);
+        let pair = ParallelPair::new("stazione", "gatto");
+        let mut rng = StdRng::seed_from_u64(7);
+        let example = build_mlm_example(&pair, &vocab, 32, 1.0, &mut rng)
+            .expect("example should contain content");
 
-        assert_eq!(
-            display_context(&example, 1, &vocab),
-            "[CLS] [MASK] tavolo [SEP]"
+        let words = tokenize("stazione");
+        let groups = vocab.encode_token_groups(&words);
+        let original = vocab.encode_tokens(&words);
+        let maskable_positions: Vec<usize> = groups[0]
+            .iter()
+            .filter_map(|&position| {
+                vocab
+                    .is_maskable(original[position])
+                    .then_some(1 + position)
+            })
+            .collect();
+
+        assert!(!maskable_positions.is_empty());
+        assert!(
+            maskable_positions
+                .iter()
+                .all(|&position| example.masked.iter().any(|&(masked, _)| masked == position)),
+            "every maskable piece of a selected word must be masked: {maskable_positions:?}"
         );
     }
 
     #[test]
-    fn test_bundled_corpus_loads() -> io::Result<()> {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/eng-it-sample.tsv");
+    fn test_sample_evaluation_examples_is_deterministic() {
+        let examples: Vec<BertExample> = (0..MLM_MAX_EVAL_EXAMPLES + 20)
+            .map(|id| BertExample {
+                token_ids: vec![id],
+                token_type_ids: vec![0],
+                masked: vec![(0, id)],
+            })
+            .collect();
+        let mut first_rng = StdRng::seed_from_u64(101);
+        let mut second_rng = StdRng::seed_from_u64(101);
+
+        let first = sample_evaluation_examples(&examples, &mut first_rng);
+        let second = sample_evaluation_examples(&examples, &mut second_rng);
+
+        assert_eq!(first.len(), MLM_MAX_EVAL_EXAMPLES);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_full_corpus_loads() -> io::Result<()> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/eng-it-full.tsv");
         let pairs = load_parallel_pairs(path)?;
-        assert_eq!(pairs.len(), 2_000);
+        assert_eq!(pairs.len(), 239_245);
         assert!(pairs.iter().all(|pair| {
             !pair.english.is_empty() && !pair.italian.is_empty() && pair.english != pair.italian
         }));
@@ -1015,6 +1258,7 @@ mod tests {
                 n_heads: 2,
                 n_layers: 1,
                 max_len: 12,
+                dropout: 0.0,
                 tie_word_embeddings: true,
             },
         )?;
@@ -1026,8 +1270,8 @@ mod tests {
             .collect();
         let mut rng = StdRng::seed_from_u64(7);
 
-        // `train_bert` no longer evaluates before training, so take the
-        // baseline explicitly if the test needs a before/after comparison.
+        // `train_bert` records a step-zero evaluation; take the same baseline
+        // here for an explicit before/after comparison.
         let initial = evaluate_bert(&mut graph, &device, &model, &eval_examples, 0)?;
 
         let history = train_bert(
@@ -1047,6 +1291,8 @@ mod tests {
                     learning_rate: 5e-3,
                     ..AdamWConfig::default()
                 },
+                validation_interval: 0,
+                ..BertTrainConfig::default()
             },
             &mut rng,
         )?;
@@ -1077,6 +1323,7 @@ mod tests {
                 n_heads: 2,
                 n_layers: 1,
                 max_len: 12,
+                dropout: 0.0,
                 tie_word_embeddings: true,
             },
         )?;
@@ -1110,16 +1357,26 @@ mod tests {
                     learning_rate: 1e-2,
                     ..AdamWConfig::default()
                 },
+                validation_interval: 0,
+                restore_best: false,
+                ..BertTrainConfig::default()
             },
             &mut rng,
         )?;
 
         assert_eq!(history.losses.len(), 2);
+        assert_eq!(history.learning_rates.len(), 2);
+        assert_eq!(history.steps_run, 2);
+        assert!(!history.stopped_early);
+        assert!(history.evaluations.len() >= 2);
+        assert!(history.best_evaluation.is_some());
         assert!(history.losses.iter().all(|loss| loss.is_finite()));
         let final_evaluation = history.final_evaluation.expect("final evaluation");
         assert_eq!(final_evaluation.step, 2);
         assert!(final_evaluation.loss.is_finite());
         assert!((0.0..=1.0).contains(&final_evaluation.masked_accuracy));
+        assert!(final_evaluation.top5_accuracy >= final_evaluation.masked_accuracy);
+        assert!(final_evaluation.top5_accuracy <= 1.0);
         assert!(final_evaluation.masked_tokens > 0);
 
         let after: Vec<Vec<f32>> = parameters

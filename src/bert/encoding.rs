@@ -365,6 +365,28 @@ impl BertVocab {
         }
     }
 
+    /// Encodes pre-tokenized words and records which output positions came from
+    /// each input word.
+    ///
+    /// With [`EncodingStrategy::Word`] every group contains one position. With
+    /// [`EncodingStrategy::Bpe`] a group contains all pieces of one word, which
+    /// lets the MLM example mask whole words instead of isolated subword pieces.
+    pub fn encode_token_groups(&self, tokens: &[String]) -> Vec<Vec<usize>> {
+        let mut groups = Vec::with_capacity(tokens.len());
+        let mut next_position = 0;
+
+        for token in tokens {
+            let length = match self.strategy {
+                EncodingStrategy::Word => 1,
+                EncodingStrategy::Bpe => self.encode_bpe_word(token).len(),
+            };
+            groups.push((next_position..next_position + length).collect());
+            next_position += length;
+        }
+
+        groups
+    }
+
     /// Decodes token IDs into a readable, space-separated string.
     pub fn decode(&self, ids: &[usize]) -> String {
         match self.strategy {
@@ -465,4 +487,31 @@ fn merge_bpe_pair(symbols: &mut Vec<String>, pair: &(String, String)) {
         }
     }
     *symbols = merged_symbols;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_token_groups_track_bpe_words() {
+        let corpus: Vec<ParallelPair> = (0..20)
+            .map(|_| ParallelPair::new("stazione", "gatto"))
+            .collect();
+        let vocab = BertVocab::build_with_strategy(&corpus, 16, 1, EncodingStrategy::Bpe);
+        let words = tokenize("stazione gatto");
+        let groups = vocab.encode_token_groups(&words);
+        let encoded = vocab.encode_tokens(&words);
+        let total_pieces: usize = groups.iter().map(Vec::len).sum();
+        let mut expected_start = 0;
+        for group in &groups {
+            assert_eq!(group.first(), Some(&expected_start));
+            assert_eq!(group.last(), Some(&(expected_start + group.len() - 1)));
+            expected_start += group.len();
+        }
+
+        assert_eq!(groups.len(), words.len());
+        assert_eq!(total_pieces, encoded.len());
+        assert!(groups.iter().any(|group| group.len() > 1));
+    }
 }

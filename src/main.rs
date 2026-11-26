@@ -3,13 +3,19 @@
 //! Usage:
 //!
 //! ```text
-//! cargo run --release -- [--cpu] [--spam] [DATA_TSV] [STEPS]
+//! cargo run --release -- [--cpu] [--spam] [--d-model N] [--d-ff N]
+//!                          [--n-heads N] [--layers N] [--max-len N]
+//!                          [--dropout P] [DATA_TSV] [STEPS]
 //! ```
 //!
 //! By default this runs the masked-language-model example on
-//! `data/eng-it-sample.tsv` for 2,000 steps. With `--spam` it runs the SMS
-//! ham/spam classifier on `data/sms-spam-sample.tsv` for 250 steps. The
-//! implementation of each example lives in `src/bert/examples/`.
+//! `data/eng-it-full.tsv` for 20,000 steps. With `--spam` it runs the SMS
+//! ham/spam classifier on `data/sms-spam-full.tsv` for 1,000 steps. Both
+//! examples default to `d_model=128`, `d_ff=256`, 4 heads, 2 layers,
+//! `max_len=64`, and `dropout=0.1`; `--max-len` must be at least four and
+//! `--n-heads` must divide `--d-model`. Corpora can be regenerated with
+//! `python scripts/prepare_datasets.py`; see `data/README.md`. The implementation
+//! of each example lives in `src/bert/examples/`.
 //!
 //! The tensor math runs on WebGPU when an adapter is available and falls back
 //! to the CPU backend otherwise. Pass `--cpu` to force the CPU.

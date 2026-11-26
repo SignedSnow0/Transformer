@@ -30,7 +30,7 @@ pub struct PositionalEncoding<R: Runtime = CpuRuntime> {
 impl<R> PositionalEncoding<R>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
     /// Builds a sinusoidal encoding table for positions `0..max_len`.
     ///

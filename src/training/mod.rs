@@ -55,6 +55,69 @@ impl Default for AdamWConfig {
     }
 }
 
+/// Warmup plus cosine decay for the AdamW learning rate.
+///
+/// Step `1` starts at `peak / warmup_steps` (or at `peak` when there is no
+/// warmup), rises linearly to `peak` by the end of warmup, then decays with a
+/// cosine curve to `peak * min_lr_ratio` on the final step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LRSchedule {
+    /// Number of linear warmup steps.
+    pub warmup_steps: usize,
+    /// Learning rate at the end of training, as a fraction of the peak.
+    pub min_lr_ratio: f32,
+}
+
+impl Default for LRSchedule {
+    fn default() -> Self {
+        Self {
+            warmup_steps: 0,
+            min_lr_ratio: 0.1,
+        }
+    }
+}
+
+impl LRSchedule {
+    /// Checks that the schedule's ratio is a valid probability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `min_lr_ratio` is outside `[0, 1]` or is not finite.
+    pub fn validate(&self) -> Result<()> {
+        if !self.min_lr_ratio.is_finite() || !(0.0..=1.0).contains(&self.min_lr_ratio) {
+            return invalid("min_lr_ratio", "must be finite and in [0, 1]");
+        }
+        Ok(())
+    }
+
+    /// Returns the learning rate for a one-based optimizer step.
+    ///
+    /// `total_steps` and `step` are clamped into a valid range, so calling this
+    /// with `step == 0` produces the first warmup value rather than zero.
+    pub fn learning_rate(&self, peak: f32, step: usize, total_steps: usize) -> f32 {
+        if !peak.is_finite() || peak <= 0.0 {
+            return peak.max(0.0);
+        }
+
+        let step = step.max(1);
+        let total_steps = total_steps.max(step);
+        let warmup = self.warmup_steps.min(total_steps.saturating_sub(1));
+        let min_ratio = self.min_lr_ratio.clamp(0.0, 1.0);
+
+        if warmup > 0 && step <= warmup {
+            return peak * step as f32 / warmup as f32;
+        }
+
+        if total_steps <= warmup + 1 {
+            return peak;
+        }
+
+        let progress = (step - warmup) as f32 / (total_steps - warmup) as f32;
+        let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress.min(1.0)).cos());
+        peak * (min_ratio + (1.0 - min_ratio) * cosine)
+    }
+}
+
 /// AdamW optimizer over a fixed list of graph parameters.
 ///
 /// Every configured parameter is updated on each [`Self::step`]. Parameters
@@ -81,7 +144,7 @@ struct AdamWState<R: Runtime> {
 impl<R> AdamW<R>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
     /// Creates an optimizer for `parameters`.
     ///
@@ -107,6 +170,19 @@ where
             state: None,
             step: 0,
         })
+    }
+
+    /// Changes the learning rate used by subsequent [`Self::step`] calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `learning_rate` is not finite or is negative.
+    pub fn set_learning_rate(&mut self, learning_rate: f32) -> Result<()> {
+        if !learning_rate.is_finite() || learning_rate < 0.0 {
+            return invalid("learning_rate", "must be finite and non-negative");
+        }
+        self.config.learning_rate = learning_rate;
+        Ok(())
     }
 
     /// Sets every parameter's accumulated gradient to zero.
@@ -396,5 +472,50 @@ mod tests {
 
         assert!(AdamW::<CpuRuntime>::new(config, &[]).is_err());
         assert!(AdamW::<CpuRuntime>::new(config, &[0, 0]).is_err());
+    }
+
+    #[test]
+    fn test_schedule_warms_up_then_decays() {
+        let schedule = LRSchedule {
+            warmup_steps: 2,
+            min_lr_ratio: 0.1,
+        };
+
+        assert_close(schedule.learning_rate(0.01, 1, 4), 0.005);
+        assert_close(schedule.learning_rate(0.01, 2, 4), 0.01);
+        assert!(schedule.learning_rate(0.01, 3, 4) < 0.01);
+        assert_close(schedule.learning_rate(0.01, 4, 4), 0.001);
+    }
+
+    #[test]
+    fn test_schedule_rejects_invalid_ratio() {
+        let schedule = LRSchedule {
+            warmup_steps: 1,
+            min_lr_ratio: 1.5,
+        };
+        assert!(schedule.validate().is_err());
+    }
+
+    #[test]
+    fn test_set_learning_rate_changes_update() -> Result<()> {
+        let device = CpuDevice::new();
+        let mut graph = Graph::<CpuRuntime>::new();
+        let parameter = graph.variable(Tensor::from_slice(&[1.0_f32], &[1], &device)?)?;
+        graph.nodes[parameter].grad = Tensor::from_slice(&[10.0_f32], &[1], &device)?;
+
+        let mut optimizer = AdamW::<CpuRuntime>::new(
+            AdamWConfig {
+                learning_rate: 0.1,
+                weight_decay: 0.0,
+                ..AdamWConfig::default()
+            },
+            &[parameter],
+        )?;
+        optimizer.set_learning_rate(0.02)?;
+        optimizer.step(&mut graph)?;
+
+        assert_close(graph.nodes[parameter].data.to_vec::<f32>()[0], 0.98);
+        assert!(optimizer.set_learning_rate(f32::NAN).is_err());
+        Ok(())
     }
 }

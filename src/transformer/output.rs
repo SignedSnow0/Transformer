@@ -42,7 +42,7 @@ impl OutputProjection {
     ) -> Result<Self>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         let w = graph.variable(Tensor::from_slice(
             &kaiming_init(d_model * vocab_size, d_model),
@@ -72,7 +72,7 @@ impl OutputProjection {
     pub fn forward<R>(&self, graph: &mut Graph<R>, x: autograd::NodeId) -> Result<autograd::NodeId>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         let logits = linear(graph, x, self.w, self.b)?;
 

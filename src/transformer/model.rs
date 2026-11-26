@@ -43,7 +43,7 @@ pub struct Transformer<R: Runtime = CpuRuntime> {
 impl<R> Transformer<R>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
     /// Builds a complete transformer with randomly initialized parameters.
     ///

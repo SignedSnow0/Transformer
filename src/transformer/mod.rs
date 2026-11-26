@@ -86,7 +86,7 @@ impl MultiHeadAttention {
     ) -> Result<Self>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         let d_head = d_model / n_heads;
         let mut w_q = Vec::with_capacity(n_heads);
@@ -169,7 +169,7 @@ impl MultiHeadAttention {
     ) -> Result<autograd::NodeId>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         let key_value = key_value.unwrap_or(query);
 
@@ -275,7 +275,7 @@ impl Encoder {
     ) -> Result<Self>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         let attn = MultiHeadAttention::new(graph, device, d_model, n_heads)?;
 
@@ -328,8 +328,9 @@ impl Encoder {
     ///
     /// 1. Pre-LayerNorm, then bidirectional multi-head self-attention
     /// 2. Residual connection
-    /// 3. Pre-LayerNorm, then position-wise FFN: Linear -> ReLU -> Linear
+    /// 3. Pre-LayerNorm, then position-wise FFN: Linear -> GELU -> Linear
     /// 4. Residual connection
+    #[allow(dead_code)]
     pub fn forward<R>(
         &self,
         graph: &mut autograd::Graph<R>,
@@ -338,16 +339,47 @@ impl Encoder {
     ) -> Result<autograd::NodeId>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
+    {
+        let mut unused_rng = StdRng::seed_from_u64(0);
+        self.forward_with_dropout(graph, device, x, 0.0, false, &mut unused_rng)
+    }
+
+    /// Forward pass with optional dropout on the residual branches.
+    ///
+    /// `rng` is only sampled when `training` is true and `dropout_probability`
+    /// is greater than zero, so evaluation passes are deterministic.
+    pub fn forward_with_dropout<R>(
+        &self,
+        graph: &mut autograd::Graph<R>,
+        device: &R::Device,
+        x: autograd::NodeId,
+        dropout_probability: f32,
+        training: bool,
+        rng: &mut impl RngExt,
+    ) -> Result<autograd::NodeId>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         let attn_input = graph.layer_norm(x, self.gamma_1, self.beta_1, LAYER_NORM_EPS)?;
         let attn_out = self.attn.forward(graph, device, attn_input, None, false)?;
+        let attn_out = if training {
+            graph.dropout(attn_out, dropout_probability, rng)?
+        } else {
+            attn_out
+        };
         let x_1 = graph.sum(x, attn_out)?;
 
         let ffn_input = graph.layer_norm(x_1, self.gamma_2, self.beta_2, LAYER_NORM_EPS)?;
         let ffn_hidden = linear(graph, ffn_input, self.w_1, self.b_1)?;
-        let ffn_activated = graph.relu(ffn_hidden)?;
+        let ffn_activated = graph.gelu(ffn_hidden)?;
         let ffn_out = linear(graph, ffn_activated, self.w_2, self.b_2)?;
+        let ffn_out = if training {
+            graph.dropout(ffn_out, dropout_probability, rng)?
+        } else {
+            ffn_out
+        };
 
         graph.sum(x_1, ffn_out)
     }
@@ -431,7 +463,7 @@ impl Decoder {
     ) -> Result<Self>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         let self_attn = MultiHeadAttention::new(graph, device, d_model, n_heads)?;
         let cross_attn = MultiHeadAttention::new(graph, device, d_model, n_heads)?;
@@ -504,7 +536,7 @@ impl Decoder {
     ) -> Result<autograd::NodeId>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         let self_attn_input = graph.layer_norm(x, self.gamma_1, self.beta_1, LAYER_NORM_EPS)?;
         let self_attn_out = self
@@ -520,7 +552,7 @@ impl Decoder {
 
         let ffn_input = graph.layer_norm(x_2, self.gamma_3, self.beta_3, LAYER_NORM_EPS)?;
         let ffn_hidden = linear(graph, ffn_input, self.w_1, self.b_1)?;
-        let ffn_activated = graph.relu(ffn_hidden)?;
+        let ffn_activated = graph.gelu(ffn_hidden)?;
         let ffn_out = linear(graph, ffn_activated, self.w_2, self.b_2)?;
 
         graph.sum(x_2, ffn_out)
@@ -536,7 +568,7 @@ pub(crate) fn linear<R>(
 ) -> Result<autograd::NodeId>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
     let wx = graph.matmul(x, w)?;
     graph.sum(wx, b)

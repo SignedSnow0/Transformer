@@ -3,8 +3,10 @@
 //! [`Graph`] stores intermediate tensors and the [`Operation`] that produced
 //! them. [`Graph::backward_with_grad`] walks those nodes in reverse order and
 //! accumulates gradients in [`Node::grad`].
+use numr::ops::ScatterReduceOp;
 use numr::prelude::*;
 use numr::runtime::cpu::CpuRuntime;
+use rand::RngExt;
 
 /// Reference to a node in a [`Graph`].
 ///
@@ -28,7 +30,15 @@ pub enum Operation {
     /// Softmax over the final tensor dimension.
     SoftMax(NodeId),
     /// ReLU activation: `x_i = max(0, x_i)`.
+    #[allow(dead_code)]
     Relu(NodeId),
+    /// GELU activation using the tanh approximation.
+    Gelu(NodeId),
+    /// Inverted dropout with a stored, scaled mask node.
+    Dropout(NodeId, NodeId),
+    /// Embedding table lookup with a two-dimensional index matrix used by the
+    /// backward scatter.
+    EmbeddingLookup(NodeId, NodeId),
     /// Two-dimensional transpose: `x_ij = a_ji`.
     Transpose(NodeId),
     /// Layer normalization: `x_i = gamma * (a_i - mean(a)) / sqrt(var(a) + eps) + beta`.
@@ -74,7 +84,7 @@ impl<R: Runtime> Graph<R> {
 impl<R> Graph<R>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
     /// Adds a leaf tensor to the graph.
     ///
@@ -222,6 +232,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the underlying tensor operation fails.
+    #[allow(dead_code)]
     pub fn relu(&mut self, a: NodeId) -> Result<NodeId> {
         let node_a = &self.nodes[a];
         let data = node_a.data.relu()?;
@@ -235,6 +246,110 @@ where
         };
 
         self.nodes.push(node);
+        Ok(self.nodes.len() - 1)
+    }
+
+    /// Applies the tanh approximation of GELU to a node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying tensor operation fails.
+    pub fn gelu(&mut self, a: NodeId) -> Result<NodeId> {
+        let x = &self.nodes[a].data;
+        let inner = x
+            .add(&x.mul(x)?.mul(x)?.mul_scalar(0.044715)?)?
+            .mul_scalar(0.797_884_6)?;
+        let data = x.mul(&inner.tanh()?.add_scalar(1.0)?)?.mul_scalar(0.5)?;
+        let grad = Tensor::zeros(data.shape(), data.dtype(), data.device())?;
+
+        self.nodes.push(Node {
+            data,
+            grad,
+            op: Some(Operation::Gelu(a)),
+        });
+        Ok(self.nodes.len() - 1)
+    }
+
+    /// Applies inverted dropout to a node.
+    ///
+    /// The mask is sampled from `rng` and stored in the graph so the backward
+    /// pass uses exactly the same mask. A probability of zero returns `a`
+    /// unchanged, which is also how evaluation passes bypass dropout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `probability` is outside `[0, 1)` or a tensor
+    /// operation fails.
+    pub fn dropout(
+        &mut self,
+        a: NodeId,
+        probability: f32,
+        rng: &mut impl RngExt,
+    ) -> Result<NodeId> {
+        if !(0.0..1.0).contains(&probability) {
+            return Err(Error::InvalidArgument {
+                arg: "probability",
+                reason: "dropout probability must be in [0, 1)".to_string(),
+            });
+        }
+        if probability == 0.0 {
+            return Ok(a);
+        }
+
+        let (dtype, device, mask, data) = {
+            let node = &self.nodes[a];
+            let scale = 1.0 / (1.0 - probability);
+            let values: Vec<f32> = (0..node.data.numel())
+                .map(|_| {
+                    if rng.random::<f32>() < probability {
+                        0.0
+                    } else {
+                        scale
+                    }
+                })
+                .collect();
+            let mask = Tensor::from_slice(&values, node.data.shape(), node.data.device())?;
+            let data = node.data.mul(&mask)?;
+            (node.data.dtype(), node.data.device().clone(), mask, data)
+        };
+
+        let mask_node = self.variable(mask)?;
+        let grad = Tensor::zeros(data.shape(), dtype, &device)?;
+
+        self.nodes.push(Node {
+            data,
+            grad,
+            op: Some(Operation::Dropout(a, mask_node)),
+        });
+        Ok(self.nodes.len() - 1)
+    }
+
+    /// Looks up rows of a trainable embedding table.
+    ///
+    /// `indices_1d` contains one token ID per row. `indices_2d` repeats those
+    /// IDs across the embedding dimension so the gradient can be scattered
+    /// back into the table without a host round trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensors have incompatible shapes or the backend
+    /// lookup fails.
+    pub fn embedding_lookup(
+        &mut self,
+        table: NodeId,
+        indices_1d: NodeId,
+        indices_2d: NodeId,
+    ) -> Result<NodeId> {
+        let device = self.nodes[table].data.device().clone();
+        let data = R::default_client(&device)
+            .embedding_lookup(&self.nodes[table].data, &self.nodes[indices_1d].data)?;
+        let grad = Tensor::zeros(data.shape(), data.dtype(), data.device())?;
+
+        self.nodes.push(Node {
+            data,
+            grad,
+            op: Some(Operation::EmbeddingLookup(table, indices_2d)),
+        });
         Ok(self.nodes.len() - 1)
     }
 
@@ -422,6 +537,52 @@ where
 
                         self.nodes[a].grad = self.nodes[a].grad.add(&grad_input)?;
                     }
+                    Operation::Gelu(a) => {
+                        let x = &self.nodes[a].data;
+                        let inner = x
+                            .add(&x.mul(x)?.mul(x)?.mul_scalar(0.044715)?)?
+                            .mul_scalar(0.797_884_6)?;
+                        let tanh = inner.tanh()?;
+                        let one_plus_tanh = tanh.add_scalar(1.0)?;
+                        let one_minus_tanh_sq =
+                            tanh.mul(&tanh)?.mul_scalar(-1.0)?.add_scalar(1.0)?;
+                        let d_inner_dx = x
+                            .mul(x)?
+                            .mul_scalar(3.0 * 0.044715)?
+                            .add_scalar(1.0)?
+                            .mul_scalar(0.797_884_6)?;
+                        let derivative = one_plus_tanh.mul_scalar(0.5)?.add(
+                            &x.mul(&one_minus_tanh_sq)?
+                                .mul(&d_inner_dx)?
+                                .mul_scalar(0.5)?,
+                        )?;
+                        let grad_input = node_grad.mul(&derivative)?;
+
+                        self.nodes[a].grad = self.nodes[a].grad.add(&grad_input)?;
+                    }
+                    Operation::Dropout(a, mask) => {
+                        let grad_input = node_grad.mul(&self.nodes[mask].data)?;
+                        self.nodes[a].grad = self.nodes[a].grad.add(&grad_input)?;
+                    }
+                    Operation::EmbeddingLookup(table, indices_2d) => {
+                        let table_data = &self.nodes[table].data;
+                        let zeros = Tensor::zeros(
+                            table_data.shape(),
+                            table_data.dtype(),
+                            table_data.device(),
+                        )?;
+                        let device = table_data.device().clone();
+                        let grad_table = R::default_client(&device).scatter_reduce(
+                            &zeros,
+                            0,
+                            &self.nodes[indices_2d].data,
+                            &node_grad,
+                            ScatterReduceOp::Sum,
+                            false,
+                        )?;
+
+                        self.nodes[table].grad = self.nodes[table].grad.add(&grad_table)?;
+                    }
                     Operation::Transpose(a) => {
                         let grad_a = node_grad.transpose(0, 1)?.contiguous()?;
 
@@ -498,7 +659,7 @@ where
 fn reduce_broadcast<R>(grad: &Tensor<R>, target_shape: &[usize]) -> Result<Tensor<R>>
 where
     R: Runtime<DType = DType>,
-    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+    R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
 {
     if grad.shape() == target_shape {
         return Ok(grad.clone());
@@ -549,6 +710,8 @@ where
 mod tests {
     use super::*;
     use numr::runtime::cpu::CpuDevice;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     fn setup() -> (CpuDevice, Graph) {
         (
@@ -845,6 +1008,82 @@ mod tests {
         assert_eq!(graph.nodes[scale].grad.shape(), &[1]);
         assert_eq!(graph.nodes[scale].grad.to_vec::<f32>(), vec![10.0]);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_op_gelu_forward_and_gradient() -> Result<()> {
+        let (device, mut graph) = setup();
+        let x = graph.variable(Tensor::from_slice(&[-1.0_f32, 0.0, 1.0], &[3], &device)?)?;
+        let out = graph.gelu(x)?;
+
+        graph.backward_with_grad(out, Tensor::ones(&[3], DType::F32, &device)?)?;
+
+        let actual = graph.nodes[out].data.to_vec::<f32>();
+        let gradients = graph.nodes[x].grad.to_vec::<f32>();
+        for (index, &value) in [-1.0_f32, 0.0, 1.0].iter().enumerate() {
+            let inner = 0.797_884_6 * (value + 0.044715 * value.powi(3));
+            let expected = 0.5 * value * (1.0 + inner.tanh());
+            assert!((actual[index] - expected).abs() < 1e-5);
+
+            let epsilon = 1e-3;
+            let upper = 0.797_884_6 * (value + epsilon + 0.044715 * (value + epsilon).powi(3));
+            let lower = 0.797_884_6 * (value - epsilon + 0.044715 * (value - epsilon).powi(3));
+            let upper = 0.5 * (value + epsilon) * (1.0 + upper.tanh());
+            let lower = 0.5 * (value - epsilon) * (1.0 + lower.tanh());
+            let expected_gradient = (upper - lower) / (2.0 * epsilon);
+            assert!(
+                (gradients[index] - expected_gradient).abs() < 1e-4,
+                "expected {expected_gradient}, got {}",
+                gradients[index]
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_op_dropout_uses_stored_mask() -> Result<()> {
+        let (device, mut graph) = setup();
+        let mut rng = StdRng::seed_from_u64(42);
+        let x = graph.variable(Tensor::from_slice(&[1.0_f32; 4], &[4], &device)?)?;
+        let out = graph.dropout(x, 0.5, &mut rng)?;
+
+        graph.backward_with_grad(out, Tensor::ones(&[4], DType::F32, &device)?)?;
+
+        let output = graph.nodes[out].data.to_vec::<f32>();
+        assert!(output.iter().all(|&value| value == 0.0 || value == 2.0));
+        assert_eq!(graph.nodes[x].grad.to_vec::<f32>(), output);
+        assert!(graph.dropout(x, 1.0, &mut rng).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_embedding_lookup_gathers_and_scatters() -> Result<()> {
+        let (device, mut graph) = setup();
+        let table = graph.variable(Tensor::from_slice(
+            &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+            &[3, 2],
+            &device,
+        )?)?;
+        let indices_1d = graph.variable(Tensor::from_slice(&[0_i64, 2, 0], &[3], &device)?)?;
+        let indices_2d = graph.variable(Tensor::from_slice(
+            &[0_i64, 0, 2, 2, 0, 0],
+            &[3, 2],
+            &device,
+        )?)?;
+        let out = graph.embedding_lookup(table, indices_1d, indices_2d)?;
+
+        graph.backward_with_grad(out, Tensor::ones(&[3, 2], DType::F32, &device)?)?;
+
+        assert_eq!(
+            graph.nodes[out].data.to_vec::<f32>(),
+            vec![1.0, 2.0, 5.0, 6.0, 1.0, 2.0]
+        );
+        assert_eq!(
+            graph.nodes[table].grad.to_vec::<f32>(),
+            vec![2.0, 2.0, 0.0, 0.0, 1.0, 1.0]
+        );
         Ok(())
     }
 

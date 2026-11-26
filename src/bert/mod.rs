@@ -16,8 +16,9 @@
 //!
 //! - the encoder blocks use the project's pre-LayerNorm residual structure,
 //!   while the original BERT uses post-LayerNorm blocks,
-//! - the MLM head uses ReLU instead of GELU,
-//! - dropout is omitted,
+//! - the feed-forward networks and MLM head use a tanh-approximated GELU,
+//! - dropout is applied to residual branches and the MLM dense head while
+//!   training, and disabled automatically for evaluation,
 //! - next-sentence prediction is not implemented; training uses MLM only.
 //!
 //! BERT is encoder-only. It is useful for masked-token prediction and for
@@ -33,12 +34,14 @@ pub mod examples;
 use crate::autograd::{self, Graph};
 use crate::transformer::{Encoder, TokenEmbedding, kaiming_init, linear};
 use numr::prelude::*;
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 
 /// LayerNorm epsilon used by BERT embeddings and the MLM head.
 pub const BERT_LAYER_NORM_EPS: f32 = 1e-5;
 
 /// Hyperparameters for [`Bert`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BertConfig {
     /// Number of tokens in the vocabulary.
     pub vocab_size: usize,
@@ -52,6 +55,8 @@ pub struct BertConfig {
     pub n_layers: usize,
     /// Maximum sequence length supported by the position embeddings.
     pub max_len: usize,
+    /// Inverted dropout probability applied during training. Zero disables it.
+    pub dropout: f32,
     /// Whether the MLM output projection shares the token embedding table.
     pub tie_word_embeddings: bool,
 }
@@ -81,6 +86,9 @@ impl BertConfig {
         }
         if self.max_len == 0 {
             return invalid("max_len", "must be greater than zero");
+        }
+        if !(0.0..1.0).contains(&self.dropout) {
+            return invalid("dropout", "must be in [0, 1)");
         }
         Ok(())
     }
@@ -115,7 +123,7 @@ impl BertEmbeddings {
     ) -> Result<Self>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         if vocab_size == 0 || d_model == 0 || max_len == 0 {
             return invalid("embedding dimensions", "must all be greater than zero");
@@ -151,7 +159,7 @@ impl BertEmbeddings {
     ) -> Result<autograd::NodeId>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         if token_ids.is_empty() {
             return invalid("token_ids", "must not be empty");
@@ -200,7 +208,7 @@ impl BertEmbeddings {
 
 /// Masked-language-model head.
 ///
-/// The head applies a learned dense projection, a ReLU, LayerNorm, and a
+/// The head applies a learned dense projection, GELU, LayerNorm, and a
 /// vocabulary projection. When weight tying is enabled, the vocabulary
 /// projection uses the transpose of the token embedding table.
 pub struct BertMlmHead {
@@ -233,7 +241,7 @@ impl BertMlmHead {
     ) -> Result<Self>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         if d_model == 0 || vocab_size == 0 {
             return invalid("MLM dimensions", "must all be greater than zero");
@@ -278,6 +286,7 @@ impl BertMlmHead {
     ///
     /// Returns an error if the head has no vocabulary projection available or
     /// if a tensor operation fails.
+    #[allow(dead_code)]
     pub fn forward<R>(
         &self,
         graph: &mut Graph<R>,
@@ -286,10 +295,40 @@ impl BertMlmHead {
     ) -> Result<autograd::NodeId>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
+    {
+        let mut unused_rng = StdRng::seed_from_u64(0);
+        self.forward_with_dropout(
+            graph,
+            hidden,
+            tied_token_embedding,
+            0.0,
+            false,
+            &mut unused_rng,
+        )
+    }
+
+    /// Produces logits with optional dropout after the dense projection.
+    pub fn forward_with_dropout<R>(
+        &self,
+        graph: &mut Graph<R>,
+        hidden: autograd::NodeId,
+        tied_token_embedding: Option<autograd::NodeId>,
+        dropout_probability: f32,
+        training: bool,
+        rng: &mut impl RngExt,
+    ) -> Result<autograd::NodeId>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         let dense = linear(graph, hidden, self.dense_w, self.dense_b)?;
-        let activated = graph.relu(dense)?;
+        let activated = graph.gelu(dense)?;
+        let activated = if training {
+            graph.dropout(activated, dropout_probability, rng)?
+        } else {
+            activated
+        };
         let normalized = graph.layer_norm(activated, self.gamma, self.beta, BERT_LAYER_NORM_EPS)?;
 
         let vocab_w = match (self.vocab_w, tied_token_embedding) {
@@ -347,7 +386,7 @@ impl Bert {
     pub fn new<R>(graph: &mut Graph<R>, device: &R::Device, config: BertConfig) -> Result<Self>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         config.validate()?;
 
@@ -400,14 +439,46 @@ impl Bert {
     ) -> Result<autograd::NodeId>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
+    {
+        let mut unused_rng = StdRng::seed_from_u64(0);
+        self.encode_with_dropout(
+            graph,
+            device,
+            token_ids,
+            token_type_ids,
+            false,
+            &mut unused_rng,
+        )
+    }
+
+    /// Runs the encoder with dropout enabled only when `training` is true.
+    pub fn encode_with_dropout<R>(
+        &self,
+        graph: &mut Graph<R>,
+        device: &R::Device,
+        token_ids: &[usize],
+        token_type_ids: &[usize],
+        training: bool,
+        rng: &mut impl RngExt,
+    ) -> Result<autograd::NodeId>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
         let mut hidden = self
             .embeddings
             .forward(graph, device, token_ids, token_type_ids)?;
 
         for layer in &self.layers {
-            hidden = layer.forward(graph, device, hidden)?;
+            hidden = layer.forward_with_dropout(
+                graph,
+                device,
+                hidden,
+                self.config.dropout,
+                training,
+                rng,
+            )?;
         }
 
         Ok(hidden)
@@ -427,15 +498,48 @@ impl Bert {
     ) -> Result<BertOutput>
     where
         R: Runtime<DType = DType>,
-        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
     {
-        let hidden = self.encode(graph, device, token_ids, token_type_ids)?;
+        let mut unused_rng = StdRng::seed_from_u64(0);
+        self.forward_with_dropout(
+            graph,
+            device,
+            token_ids,
+            token_type_ids,
+            false,
+            &mut unused_rng,
+        )
+    }
+
+    /// Runs the full model with dropout controlled by `training`.
+    pub fn forward_with_dropout<R>(
+        &self,
+        graph: &mut Graph<R>,
+        device: &R::Device,
+        token_ids: &[usize],
+        token_type_ids: &[usize],
+        training: bool,
+        rng: &mut impl RngExt,
+    ) -> Result<BertOutput>
+    where
+        R: Runtime<DType = DType>,
+        R::Client: TensorOps<R> + CompareOps<R> + ScalarOps<R> + IndexingOps<R>,
+    {
+        let hidden =
+            self.encode_with_dropout(graph, device, token_ids, token_type_ids, training, rng)?;
         let tied = if self.config.tie_word_embeddings {
             Some(self.embeddings.token.table)
         } else {
             None
         };
-        let logits = self.mlm.forward(graph, hidden, tied)?;
+        let logits = self.mlm.forward_with_dropout(
+            graph,
+            hidden,
+            tied,
+            self.config.dropout,
+            training,
+            rng,
+        )?;
 
         Ok(BertOutput { logits })
     }
@@ -481,6 +585,7 @@ mod tests {
             n_heads: 2,
             n_layers: 2,
             max_len: 10,
+            dropout: 0.0,
             tie_word_embeddings,
         }
     }
